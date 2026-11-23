@@ -14,23 +14,46 @@ pub struct PlacedWorker {
     pub load_reservation: Option<crate::core::LoadReservation>,
 }
 
+/// What a policy sees of `descriptor`.
+pub(crate) fn select_info<'a>(
+    descriptor: &RequestDescriptor<'a>,
+    hash_ring: Option<Arc<HashRing>>,
+) -> SelectWorkerInfo<'a> {
+    SelectWorkerInfo {
+        request_text: descriptor.text,
+        tokens: descriptor.tokens,
+        headers: descriptor.headers,
+        hash_ring,
+        carries_media: descriptor.carries_media,
+    }
+}
+
 pub async fn apply_policy(
     candidates: &[Arc<dyn Worker>],
     policy: &dyn LoadBalancingPolicy,
     descriptor: &RequestDescriptor<'_>,
     hash_ring: Option<Arc<HashRing>>,
 ) -> Result<PlacedWorker, PlacementError> {
+    apply_policy_as(candidates, policy, descriptor, hash_ring, None).await
+}
+
+/// [`apply_policy`], recording a selection under `branch` instead of the policy's own
+/// branch when given. A failed selection keeps the policy's reason.
+pub(crate) async fn apply_policy_as(
+    candidates: &[Arc<dyn Worker>],
+    policy: &dyn LoadBalancingPolicy,
+    descriptor: &RequestDescriptor<'_>,
+    hash_ring: Option<Arc<HashRing>>,
+    branch: Option<&'static str>,
+) -> Result<PlacedWorker, PlacementError> {
     if candidates.is_empty() {
         return Err(PlacementError::NoAvailableWorkers);
     }
-    let info = SelectWorkerInfo {
-        request_text: descriptor.text,
-        tokens: descriptor.tokens,
-        headers: descriptor.headers,
-        hash_ring,
-        carries_media: descriptor.carries_media,
-    };
-    let (idx, decision) = policy.select_with_decision(candidates, &info).await;
+    let info = select_info(descriptor, hash_ring);
+    let (idx, mut decision) = policy.select_with_decision(candidates, &info).await;
+    if let (Some(branch), Some(_)) = (branch, idx) {
+        decision.branch = branch;
+    }
     let selected = idx.map(|idx| candidates[idx].clone());
     // The planner passes the candidates of one pool.
     let pool = candidates[0].worker_type().as_metric_label();

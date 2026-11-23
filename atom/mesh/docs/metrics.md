@@ -116,6 +116,8 @@ Defaults are the CLI defaults.
 | | `text_relocate` | The same, but another worker holds the longest text match. | ratio |
 | | `text_miss` | The same; nothing in the text tree matches. | ratio |
 | | `unmatched` | Neither tokens nor text: the lowest cost by load. | |
+| `least_load` | `least_load` | The lowest outstanding decode cost. | |
+| | `least_load_pair` | Under idx2idx with `agentic` on prefill: the lowest decode cost plus its rank's lowest [prefill cost](agentic_cost.md). | |
 
 ## Reading the values
 

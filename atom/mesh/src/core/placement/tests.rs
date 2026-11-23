@@ -976,6 +976,123 @@ mod d_pd_planning {
         );
     }
 
+    /// Prefill p and decode d, each on DP ranks 0 and 1, with `least_load` on decode.
+    struct LeastLoadCluster {
+        planner: DefaultPlanner,
+        prefills: [Arc<dyn Worker>; 2],
+        decodes: [Arc<dyn Worker>; 2],
+    }
+
+    /// A 1000-token prompt whose text the `agentic` tree estimates at 1000 tokens.
+    const PROMPT_TOKENS: [u32; 1000] = [7; 1000];
+
+    impl LeastLoadCluster {
+        fn new(prefill_policy: Arc<dyn LoadBalancingPolicy>, prefill_on_decode_rank: bool) -> Self {
+            let prefills = [0, 1].map(|rank| dp_worker("http://p", rank, prefill()));
+            let decodes = [0, 1].map(|rank| dp_worker("http://d", rank, WorkerType::Decode));
+            let source = prefills
+                .iter()
+                .chain(&decodes)
+                .fold(MockWorkerSource::new(), |source, worker| {
+                    source.add_worker(worker.clone())
+                });
+            let policies = MockPolicySource::new()
+                .with_prefill(prefill_policy)
+                .with_decode(Arc::new(crate::policies::LeastLoadPolicy::default()));
+            let planner =
+                make_planner(source, policies).with_prefill_on_decode_rank(prefill_on_decode_rank);
+            Self {
+                planner,
+                prefills,
+                decodes,
+            }
+        }
+
+        /// The prefill and decode URLs planned for the session's prompt.
+        async fn place(&self) -> (String, String) {
+            let text = "x".repeat(4 * PROMPT_TOKENS.len());
+            let descriptor = make_descriptor(Some("m"), Some(&text), Some(&PROMPT_TOKENS), None);
+            match self.planner.plan(&descriptor).await.unwrap() {
+                PlacementPlan::Pair {
+                    prefill, decode, ..
+                } => (prefill.url().to_string(), decode.url().to_string()),
+                other => panic!("expected Pair, got {:?}", other),
+            }
+        }
+
+        /// Places the session's first turn on rank 1, then makes decode rank 1 the
+        /// heavier one.
+        async fn cache_on_rank_1(&self) {
+            self.prefills[0].set_healthy(false);
+            self.decodes[0].set_healthy(false);
+            assert_eq!(
+                self.place().await,
+                ("http://p@1".to_string(), "http://d@1".to_string())
+            );
+            self.prefills[0].set_healthy(true);
+            self.decodes[0].set_healthy(true);
+            self.decodes[1].charge_decode_load(Some(100));
+        }
+    }
+
+    fn agentic() -> Arc<dyn LoadBalancingPolicy> {
+        Arc::new(crate::policies::AgenticPolicy::default())
+    }
+
+    fn pair(prefill: &str, decode: &str) -> (String, String) {
+        (prefill.to_string(), decode.to_string())
+    }
+
+    /// A prefix on rank 1 pulls decode to rank 1 although decode rank 0 is lighter, and
+    /// the decode selection is recorded as `least_load_pair`.
+    #[tokio::test]
+    async fn test_idx2idx_pair_follows_the_cached_prefill_rank() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let cluster = LeastLoadCluster::new(agentic(), true);
+        cluster.cache_on_rank_1().await;
+
+        assert_eq!(cluster.place().await, pair("http://p@1", "http://d@1"));
+        let decode_branches: Vec<_> = handle
+            .render()
+            .lines()
+            .filter(|line| line.starts_with(r#"mesh_route_branch_total{pool="decode""#))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            decode_branches,
+            [
+                r#"mesh_route_branch_total{pool="decode",policy="least_load",branch="least_load_pair"} 2"#
+            ]
+        );
+    }
+
+    /// A rank-1 prefill queue longer than the prefix hit sends the request to rank 0.
+    #[tokio::test]
+    async fn test_idx2idx_pair_leaves_a_prefill_queue_longer_than_the_hit() {
+        let cluster = LeastLoadCluster::new(agentic(), true);
+        cluster.cache_on_rank_1().await;
+        cluster.prefills[1].charge_prefill_tokens(2 * PROMPT_TOKENS.len());
+
+        assert_eq!(cluster.place().await, pair("http://p@0", "http://d@0"));
+    }
+
+    /// Without idx2idx, or with a prefill policy other than `agentic`, decode follows
+    /// its own load.
+    #[tokio::test]
+    async fn test_least_load_follows_decode_load_outside_the_agentic_pair() {
+        let off = LeastLoadCluster::new(agentic(), false);
+        off.cache_on_rank_1().await;
+        assert_eq!(off.place().await, pair("http://p@1", "http://d@0"));
+
+        let round_robin = LeastLoadCluster::new(Arc::new(RoundRobinPolicy::new()), true);
+        round_robin.cache_on_rank_1().await;
+        for _ in 0..2 {
+            assert_eq!(round_robin.place().await.1, "http://d@0");
+        }
+    }
+
     #[tokio::test]
     async fn test_pair_charges_the_prefill_worker_whether_or_not_streaming() {
         let planner = make_planner(one_p_one_d_http("m"), MockPolicySource::new());

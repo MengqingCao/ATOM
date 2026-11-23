@@ -26,7 +26,18 @@ prefill response completes or at a streaming response's first frame.
 Non-streaming regular, gRPC and ext-proc single-worker requests are not
 charged, so their prefills weigh only through `inflight_requests`. Under
 idx2idx the planner selects decode first, so `agentic` chooses among the
-prefill workers on its rank. For a request the index can match, `agentic`
+prefill workers on its rank. With `least_load` on decode, the decode is chosen
+with the prefill cost of its rank:
+
+```text
+decode = argmin over d of
+  least_load_cost(d) + min(agentic_cost(p) for p on d's rank)
+```
+
+ties at random, so a session follows the rank whose prefill holds its prefix
+until that rank's decode and prefill queues cost more than the hit saves. The
+decode selection is recorded under the branch `least_load_pair`. Other policy
+pairs select decode by its own policy. For a request the index can match, `agentic`
 predicts the selected worker's blocks (`on_routed`) and reports an estimated
 hit ratio, reconciled with the cached tokens the engine reports.
 

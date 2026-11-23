@@ -46,6 +46,43 @@ impl LeastLoadPolicy {
     fn prompt_tokens(info: &SelectWorkerInfo<'_>) -> Option<usize> {
         info.tokens.map(<[u32]>::len)
     }
+
+    /// Each worker's cost, `None` for an unhealthy one, and whether the costs
+    /// compare tokens. One mode holds across the whole set: any untokenized
+    /// request on a healthy worker, or a request without tokens, makes every
+    /// cost the in-flight count.
+    fn scoring(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> (Vec<Option<u128>>, bool) {
+        let healthy = get_healthy_worker_indices(workers);
+        let compare_tokens = Self::prompt_tokens(info).is_some()
+            && healthy
+                .iter()
+                .all(|&idx| workers[idx].decode_untokenized() == 0);
+        let mut costs = vec![None; workers.len()];
+        for idx in healthy {
+            let worker = &workers[idx];
+            let load = worker.load() as u128;
+            costs[idx] = Some(if compare_tokens {
+                worker.decode_kv_tokens() as u128 + u128::from(self.request_token_equivalent) * load
+            } else {
+                load
+            });
+        }
+        (costs, compare_tokens)
+    }
+
+    /// Each worker's outstanding decode cost, `None` for an unhealthy one, in
+    /// the units the selection ranks by. Takes no reservation.
+    pub(crate) fn costs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Vec<Option<u128>> {
+        self.scoring(workers, info).0
+    }
 }
 
 impl Default for LeastLoadPolicy {
@@ -65,36 +102,18 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let healthy = get_healthy_worker_indices(workers);
-        if healthy.is_empty() {
-            return (None, RouteDecision::branch(super::NO_HEALTHY_WORKERS));
-        }
-
-        let prompt = Self::prompt_tokens(info);
-        let compare_tokens = prompt.is_some()
-            && healthy
-                .iter()
-                .all(|&idx| workers[idx].decode_untokenized() == 0);
-
-        let mut best: Option<(u128, usize, usize)> = None;
-        for idx in healthy {
-            let worker = &workers[idx];
-            let load = worker.load();
-            let cost = if compare_tokens {
-                worker.decode_kv_tokens() as u128
-                    + u128::from(self.request_token_equivalent) * load as u128
-            } else {
-                load as u128
-            };
-            let rank = (cost, load, idx);
-            if best.is_none_or(|current| rank < current) {
-                best = Some(rank);
-            }
-        }
+        let (costs, compare_tokens) = self.scoring(workers, info);
+        // Ties go to the fewer in-flight requests, then the lower index.
+        let best = costs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, cost)| cost.map(|cost| (cost, workers[idx].load(), idx)))
+            .min();
         let Some((_, _, idx)) = best else {
             return (None, RouteDecision::branch(super::NO_HEALTHY_WORKERS));
         };
 
+        let prompt = Self::prompt_tokens(info);
         let tokens = if compare_tokens { prompt } else { None };
         let hold = LoadReservation::charge(workers[idx].clone(), tokens);
         let id = state.next_id;
@@ -276,5 +295,70 @@ mod tests {
         drop(policy.take_load_reservation(decision.reservation_id.unwrap()));
         assert_eq!(workers[0].load(), 0);
         assert_eq!(workers[0].decode_untokenized(), 0);
+    }
+
+    #[tokio::test]
+    async fn costs_take_no_reservation() {
+        let policy = LeastLoadPolicy::default();
+        let workers = vec![worker("http://d0"), worker("http://d1")];
+        seed(&workers[0], 2_000, 1, 0);
+        let prompt = [0u32; 8];
+        let info = info_with(&prompt);
+        assert_eq!(policy.costs(&workers, &info), [Some(2_512), Some(0)]);
+        assert_eq!(policy.costs(&workers, &info), [Some(2_512), Some(0)]);
+        assert_eq!((workers[0].load(), workers[1].load()), (1, 0));
+        assert_eq!(workers[0].decode_kv_tokens(), 2_000);
+        assert!(policy.state.lock().unwrap().holds.is_empty());
+        workers[1].set_healthy(false);
+        assert_eq!(policy.costs(&workers, &info), [Some(2_512), None]);
+    }
+
+    #[tokio::test]
+    async fn costs_keep_one_mode_across_the_set() {
+        let policy = LeastLoadPolicy::default();
+        let workers = vec![worker("http://d0"), worker("http://d1")];
+        seed(&workers[0], 0, 0, 5);
+        seed(&workers[1], 100_000, 1, 0);
+        let prompt = [0u32; 4];
+        // One untokenized worker makes every cost the in-flight count.
+        assert_eq!(
+            policy.costs(&workers, &info_with(&prompt)),
+            [Some(5), Some(1)]
+        );
+        // So does a request without tokens.
+        workers[0].set_healthy(false);
+        let untokenized = SelectWorkerInfo::default();
+        assert_eq!(policy.costs(&workers, &untokenized), [None, Some(1)]);
+        assert_eq!(
+            policy.costs(&workers, &info_with(&prompt)),
+            [None, Some(100_512)]
+        );
+    }
+
+    #[tokio::test]
+    async fn select_chooses_among_the_lowest_costs() {
+        let prompt = [0u32; 8];
+        // (kv, requests, untokenized) per worker, as the tests above seed them.
+        let fixtures = [
+            [(2_000, 1, 0), (100, 1, 0)],
+            [(100, 2, 0), (100, 1, 0)],
+            [(10, 1, 0), (10, 1, 0)],
+            [(0, 0, 5), (100_000, 1, 0)],
+            [(0, 0, 0), (0, 0, 0)],
+        ];
+        for fixture in fixtures {
+            for info in [info_with(&prompt), SelectWorkerInfo::default()] {
+                let policy = LeastLoadPolicy::default();
+                let workers = vec![worker("http://d0"), worker("http://d1")];
+                for (worker, &(kv, requests, untokenized)) in workers.iter().zip(&fixture) {
+                    seed(worker, kv, requests, untokenized);
+                }
+                let costs = policy.costs(&workers, &info);
+                let best = costs.iter().flatten().min();
+                let (idx, decision) = policy.select_with_decision(&workers, &info).await;
+                assert_eq!(costs[idx.unwrap()].as_ref(), best, "{fixture:?}");
+                drop(policy.take_load_reservation(decision.reservation_id.unwrap()));
+            }
+        }
     }
 }

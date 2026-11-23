@@ -1,9 +1,10 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use rand::seq::IteratorRandom;
 use tracing::debug;
 
-use super::policy_apply::{apply_policy, PlacedWorker};
+use super::policy_apply::{apply_policy, apply_policy_as, select_info, PlacedWorker};
 use super::traits::{PdPlanner, PolicySource, WorkerSource};
 use super::types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor};
 use crate::core::{ConnectionMode, HashRing, Worker, WorkerType};
@@ -11,7 +12,12 @@ use crate::observability::{
     metrics::{metrics_labels, MeshMetrics},
     route_trace,
 };
-use crate::policies::{LoadBalancingPolicy, NO_HEALTHY_WORKERS};
+use crate::policies::{
+    AgenticPolicy, LeastLoadPolicy, LoadBalancingPolicy, SelectWorkerInfo, NO_HEALTHY_WORKERS,
+};
+
+/// The decode branch recorded when `least_load` and `agentic` choose the pair together.
+pub(crate) const LEAST_LOAD_PAIR: &str = "least_load_pair";
 
 fn health_filter(pool: Vec<Arc<dyn Worker>>) -> Vec<Arc<dyn Worker>> {
     pool.into_iter().filter(|w| w.is_available()).collect()
@@ -63,6 +69,41 @@ fn on_decode_rank(prefill: Vec<Arc<dyn Worker>>, decode: &dyn Worker) -> Vec<Arc
     }
 }
 
+/// Under idx2idx with `least_load` on decode and `agentic` on prefill, the decode whose
+/// own cost plus the lowest prefill cost on its rank is lowest, ties at random, so a
+/// session follows the prefill rank holding its prefix while that is cheaper overall.
+/// `None` for any other policy pair.
+fn least_load_pair(
+    prefill: &[Arc<dyn Worker>],
+    prefill_policy: &dyn LoadBalancingPolicy,
+    decode: &[Arc<dyn Worker>],
+    decode_policy: &dyn LoadBalancingPolicy,
+    info: &SelectWorkerInfo<'_>,
+) -> Option<Arc<dyn Worker>> {
+    let least_load = decode_policy.as_any().downcast_ref::<LeastLoadPolicy>()?;
+    let agentic = prefill_policy.as_any().downcast_ref::<AgenticPolicy>()?;
+    // idx2idx keeps the same prefills for every decode on one DP rank: score each rank once.
+    let mut rank_costs = HashMap::new();
+    let pair_costs: Vec<(u128, &Arc<dyn Worker>)> = least_load
+        .costs(decode, info)
+        .into_iter()
+        .zip(decode)
+        .filter_map(|(decode_cost, worker)| {
+            let prefill_cost = *rank_costs.entry(worker.dp_rank()).or_insert_with(|| {
+                let on_rank = on_decode_rank(prefill.to_vec(), worker.as_ref());
+                agentic.costs(&on_rank, info).into_iter().flatten().min()
+            });
+            Some((decode_cost? + prefill_cost?, worker))
+        })
+        .collect();
+    let best = pair_costs.iter().map(|(cost, _)| *cost).min()?;
+    pair_costs
+        .into_iter()
+        .filter(|(cost, _)| *cost == best)
+        .map(|(_, worker)| worker.clone())
+        .choose(&mut rand::rng())
+}
+
 /// Prompt tokens charged to `placed`, which prefills `req`: the policy's estimate, or
 /// the whole prompt.
 fn prefill_tokens(placed: &PlacedWorker, req: &RequestDescriptor<'_>) -> usize {
@@ -88,7 +129,8 @@ impl DefaultPlanner {
 
     /// Under ATOM's idx2idx rank mapping, select decode first and offer the prefill policy
     /// the candidates idx2idx keeps for it, so the prefill it selects is the one the
-    /// request runs on.
+    /// request runs on. With `least_load` on decode and `agentic` on prefill, the decode
+    /// is chosen with its rank's prefill cost.
     pub fn with_prefill_on_decode_rank(mut self, enabled: bool) -> Self {
         self.prefill_on_decode_rank = enabled;
         self
@@ -163,7 +205,27 @@ impl DefaultPlanner {
             )
         };
         let decode_first = if self.prefill_on_decode_rank {
-            Some(select_decode().await?)
+            let info = select_info(req, hash_ring.clone());
+            let pair = least_load_pair(
+                &prefill_candidates,
+                prefill_policy.as_ref(),
+                &decode_candidates,
+                decode_policy.as_ref(),
+                &info,
+            );
+            Some(match pair {
+                Some(decode) => {
+                    apply_policy_as(
+                        &[decode],
+                        decode_policy.as_ref(),
+                        req,
+                        hash_ring.clone(),
+                        Some(LEAST_LOAD_PAIR),
+                    )
+                    .await?
+                }
+                None => select_decode().await?,
+            })
         } else {
             None
         };

@@ -185,16 +185,110 @@ impl AgenticPolicy {
         }
     }
 
-    fn tree(&self, worker: &dyn Worker) -> Arc<Tree> {
+    fn existing_tree(&self, worker: &dyn Worker) -> Option<Arc<Tree>> {
         let key = normalize_model_key(worker.model_id());
-        if let Some(tree) = self.trees.get(key) {
-            return tree.clone();
-        }
-        self.trees
-            .entry(key.to_string())
-            .or_insert_with(|| Arc::new(Tree::new()))
-            .clone()
+        self.trees.get(key).map(|tree| tree.clone())
     }
+
+    fn tree(&self, worker: &dyn Worker) -> Arc<Tree> {
+        self.existing_tree(worker).unwrap_or_else(|| {
+            self.trees
+                .entry(normalize_model_key(worker.model_id()).to_string())
+                .or_insert_with(|| Arc::new(Tree::new()))
+                .clone()
+        })
+    }
+
+    /// Scores every healthy worker for this request and writes nothing: no tree
+    /// is created or taught, and the index is not told of a placement. `None`
+    /// when no worker is healthy.
+    fn scoring<'a>(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'a>,
+    ) -> Option<Scoring<'a>> {
+        let healthy = get_healthy_worker_indices(workers);
+        let first = workers[*healthy.first()?].as_ref();
+        let tokens = info.tokens.filter(|tokens| !tokens.is_empty());
+        let text = info.request_text.filter(|text| !text.is_empty());
+        let prompt_tokens = match (tokens, text) {
+            (Some(tokens), _) => tokens.len(),
+            (None, Some(text)) => estimated_tokens(text.len()),
+            (None, None) => 0,
+        };
+        // The index cannot match media.
+        let matchable = tokens.filter(|_| !info.carries_media);
+        let index_hits = matchable
+            .zip(self.kv_events.get())
+            .map(|(tokens, provider)| provider.match_workers(tokens, workers))
+            .filter(|hits| healthy.iter().any(|&idx| hits[idx].is_some()));
+        let tree = text.and_then(|_| self.existing_tree(first));
+        let (source, hits) = match (index_hits, text) {
+            (Some(hits), _) => (
+                Hits::Index,
+                hits.into_iter()
+                    .map(|hit| hit.map(|tokens| tokens as usize))
+                    .collect(),
+            ),
+            (None, Some(text)) => (
+                Hits::Text,
+                // A tree not yet created holds no text: every worker misses.
+                match &tree {
+                    Some(tree) => text_hits(tree, text, workers, &healthy),
+                    None => vec![Some(0); workers.len()],
+                },
+            ),
+            (None, None) => (Hits::Unmatched, vec![None; workers.len()]),
+        };
+        let candidates = healthy
+            .iter()
+            .map(|&idx| Candidate {
+                worker_index: idx,
+                cached_tokens: hits[idx].map(|cached| cached.min(prompt_tokens)),
+                inflight_prefill_tokens: workers[idx].prefill_tokens(),
+                inflight_requests: workers[idx].load(),
+            })
+            .collect();
+        Some(Scoring {
+            prompt_tokens,
+            matchable,
+            text,
+            tree,
+            source,
+            hits,
+            candidates,
+        })
+    }
+
+    /// Each worker's cost for this request, `None` for an unhealthy one, in the
+    /// units [`AgenticCost::score`] ranks by. Commits nothing.
+    pub(crate) fn costs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Vec<Option<u128>> {
+        let mut costs = vec![None; workers.len()];
+        if let Some(scoring) = self.scoring(workers, info) {
+            for candidate in &scoring.candidates {
+                let cost = self.cost.score(scoring.prompt_tokens, candidate).cost;
+                costs[candidate.worker_index] = Some(cost);
+            }
+        }
+        costs
+    }
+}
+
+/// One request's scored candidates and what placing it must commit.
+struct Scoring<'a> {
+    prompt_tokens: usize,
+    /// Tokens the index can match, to report the placement to it.
+    matchable: Option<&'a [u32]>,
+    text: Option<&'a str>,
+    /// The model's text tree, if one exists yet.
+    tree: Option<Arc<Tree>>,
+    source: Hits,
+    hits: Vec<Option<usize>>,
+    candidates: Vec<Candidate>,
 }
 
 impl Default for AgenticPolicy {
@@ -238,53 +332,29 @@ impl LoadBalancingPolicy for AgenticPolicy {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> (Option<usize>, RouteDecision) {
-        let healthy = get_healthy_worker_indices(workers);
-        if healthy.is_empty() {
+        let Some(Scoring {
+            prompt_tokens,
+            matchable,
+            text,
+            tree,
+            source,
+            hits,
+            candidates,
+        }) = self.scoring(workers, info)
+        else {
             return (None, RouteDecision::branch(NO_HEALTHY_WORKERS));
-        }
-        let tokens = info.tokens.filter(|tokens| !tokens.is_empty());
-        let text = info.request_text.filter(|text| !text.is_empty());
-        let prompt_tokens = match (tokens, text) {
-            (Some(tokens), _) => tokens.len(),
-            (None, Some(text)) => estimated_tokens(text.len()),
-            (None, None) => 0,
         };
-        // The index cannot match media.
-        let matchable = tokens.filter(|_| !info.carries_media);
-        let provider = self.kv_events.get();
-        let index_hits = matchable
-            .zip(provider)
-            .map(|(tokens, provider)| provider.match_workers(tokens, workers))
-            .filter(|hits| healthy.iter().any(|&idx| hits[idx].is_some()));
-        let tree = text.map(|_| self.tree(workers[healthy[0]].as_ref()));
-        let (source, hits) = match (index_hits, text.zip(tree.as_deref())) {
-            (Some(hits), _) => (
-                Hits::Index,
-                hits.into_iter()
-                    .map(|hit| hit.map(|tokens| tokens as usize))
-                    .collect(),
-            ),
-            (None, Some((text, tree))) => (Hits::Text, text_hits(tree, text, workers, &healthy)),
-            (None, None) => (Hits::Unmatched, vec![None; workers.len()]),
-        };
-
-        let candidates: Vec<Candidate> = healthy
-            .iter()
-            .map(|&idx| Candidate {
-                worker_index: idx,
-                cached_tokens: hits[idx].map(|cached| cached.min(prompt_tokens)),
-                inflight_prefill_tokens: workers[idx].prefill_tokens(),
-                inflight_requests: workers[idx].load(),
-            })
-            .collect();
         let Some(selection) = self.cost.select_worker(prompt_tokens, &candidates) else {
             return (None, RouteDecision::branch(NO_HEALTHY_WORKERS));
         };
         let selected = workers[selection.worker_index].as_ref();
-        if let (Some(tokens), Some(provider)) = (matchable, provider) {
+        if let (Some(tokens), Some(provider)) = (matchable, self.kv_events.get()) {
             provider.on_routed(tokens, selected);
         }
-        if let (Some(text), Some(tree)) = (text, &tree) {
+        if let Some(text) = text {
+            // Keyed by the first healthy worker, as the scoring looked it up.
+            let first = workers[candidates[0].worker_index].as_ref();
+            let tree = tree.unwrap_or_else(|| self.tree(first));
             tree.insert(text, selected.url());
         }
         selected.increment_processed();
@@ -611,5 +681,90 @@ mod tests {
             decide(&policy, &workers, &Default::default()).await,
             nothing
         );
+    }
+
+    /// The workers holding the lowest cost.
+    fn argmin(costs: &[Option<u128>]) -> Vec<usize> {
+        let best = costs.iter().flatten().min();
+        (0..costs.len())
+            .filter(|&idx| costs[idx].is_some() && costs[idx].as_ref() == best)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn costs_commit_nothing() {
+        let workers = workers();
+        workers[0].increment_load();
+        let index = index(vec![(A, 96), (B, 0)]);
+        let policy = agentic(512, Some(&index));
+        let tokens: Vec<u32> = (0..100).collect();
+        let text = "x".repeat(400);
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            request_text: Some(&text),
+            ..Default::default()
+        };
+        let first = policy.costs(&workers, &info);
+        assert_eq!(first, [Some(4 + 512), Some(100)]);
+        assert_eq!(policy.costs(&workers, &info), first);
+        assert!(index.routed.lock().unwrap().is_empty());
+        assert!(policy.trees.is_empty());
+        assert!(workers.iter().all(|w| w.processed_requests() == 0));
+        assert_eq!((workers[0].load(), workers[1].load()), (1, 0));
+
+        // Without a tree yet, text scores as a miss everywhere, as an empty tree would.
+        let text_only = SelectWorkerInfo {
+            request_text: Some(&text),
+            ..Default::default()
+        };
+        assert_eq!(policy.costs(&workers, &text_only), [Some(612), Some(100)]);
+        assert!(policy.trees.is_empty());
+        workers[1].set_healthy(false);
+        assert_eq!(policy.costs(&workers, &text_only), [Some(612), None]);
+        workers[0].set_healthy(false);
+        assert_eq!(policy.costs(&workers, &text_only), [None, None]);
+    }
+
+    #[tokio::test]
+    async fn select_chooses_among_the_lowest_costs() {
+        let workers = workers();
+        workers[0].increment_load();
+        let index = index(vec![(A, 96), (B, 0)]);
+        let tokens: Vec<u32> = (0..100).collect();
+        let text = "x".repeat(400);
+        let longer = format!("{text}{}", "y".repeat(400));
+        let media = SelectWorkerInfo {
+            tokens: Some(&tokens[..10]),
+            request_text: Some(&text),
+            carries_media: true,
+            ..Default::default()
+        };
+        let requests = [
+            SelectWorkerInfo {
+                tokens: Some(&tokens),
+                ..Default::default()
+            },
+            SelectWorkerInfo {
+                request_text: Some(&text),
+                ..Default::default()
+            },
+            SelectWorkerInfo {
+                request_text: Some(&longer),
+                ..Default::default()
+            },
+            media.clone(),
+            SelectWorkerInfo {
+                carries_media: false,
+                ..media
+            },
+            SelectWorkerInfo::default(),
+        ];
+        for policy in [agentic(512, Some(&index)), agentic(0, None)] {
+            for info in &requests {
+                let costs = policy.costs(&workers, info);
+                let (selected, _) = policy.select_with_decision(&workers, info).await;
+                assert!(argmin(&costs).contains(&selected.unwrap()), "{costs:?}");
+            }
+        }
     }
 }

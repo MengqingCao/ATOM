@@ -26,7 +26,7 @@ point without losing accuracy.
 flowchart LR
   cap["captured M3.1 decode routing<br/>(hidden, topk ids, topk weights)"] --> bench["bench: 4 ranks, requests per rank<br/>c140 / c150 mean and p90"]
   base["baseline: aiter 62cb8decf<br/>staged route, act silu, limit 7"] --> bench
-  tuned["tuned: SwiGLU-OAI epilogue<br/>+ fused small-input route"] --> bench
+  tuned["tuned: SwiGLU-OAI epilogue<br/>+ fused small-input route<br/>+ its tuning"] --> bench
   bench --> t["time per call<br/>(graph replay, max over ranks)"]
   bench --> e["relL2 vs fp32 reference<br/>of each op's own activation"]
   t --> ok{"base / tuned >= 1.60<br/>at every point"}
@@ -39,9 +39,12 @@ flowchart LR
 flowchart LR
   req["P/D decode step, DP rank r<br/>(its own requests, 8 verify rows each)"] --> attn["attention at TP1"]
   attn --> gate["router: sigmoid + bias, top-4"]
-  gate --> mega["MegaFusedExperts: MegaMoEV2<br/>routed, max_tokens = DP-group max rows<br/>act swigluoai, alpha 1.702, limit 7<br/>combine wire bf16"]
+  gate --> pick{"DP group's running rows<br/>>= A's MXFP4 threshold?"}
+  pick -->|yes| mega["MegaFusedExperts: MegaMoEV2<br/>routed, max_tokens = DP-group max rows<br/>act swigluoai, alpha 1.702, limit 7<br/>MXFP8 activations, combine wire bf16"]
+  pick -->|no| mori["B1 path: MoRI dispatch / combine<br/>around fused_moe, bf16 activations"]
   attn --> shared["shared expert: own MXFP8 MLP"]
   mega --> sum["routed + shared"]
+  mori --> sum
   shared --> sum
   sum --> next["next layer / DSpark draft at TP1"]
 ```
@@ -79,8 +82,8 @@ requests (`cost-model/dp/x1.least_requests.summary.json`). That gives:
 
 Those runs were NVFP4 on an older stack, so the points can move on the target
 stack. The benchmark also sweeps 4..40 requests per rank so the table brackets
-wherever they land; T3's first B1 / B2 run reports the real decode batch, and
-A1's final check reruns at those points.
+wherever they land. T3 reports the real decode batch of its B2 runs and reruns
+T1's recorded A1 command at those points (see Summary).
 
 ## Operator baseline and microbenchmark
 
@@ -99,7 +102,7 @@ SwiGLU-OAI epilogue, which only makes the 1.6x test stricter. Each op's error
 is measured against the fp32 reference of its own activation.
 
 The baseline instance is the one `atom/model_ops/fused_moe/flydsl_mega_experts.py:
-_get_mega` builds: `MegaMoEV2(quant="a8w4", max_tok_per_rank=512,
+get_or_build_mega_moe` builds: `MegaMoEV2(quant="a8w4", max_tok_per_rank=512,
 swiglu_limit=7.0)`, called without `max_tokens`, which takes the staged
 compact route. MTPR 512 stays in the bounded config class, whose combine wire
 is `none`, bf16 (`mega_moe_config._select_bucket_config`,
@@ -181,24 +184,42 @@ streams its 32 experts either way, so it does not set the time.
 | stage2 -> combine | C4, K-rank | per-token counter on the peer rows | fuse: `make_fused_combine_tail` is the same sum |
 | MoE -> shared expert | separate MLP | none | keep: the overlay keeps the shared expert its own MXFP8 MLP |
 
-**Candidates**, priced at c140_mean (283 us) and c140_p90 (308 us); target
-177 us and 192 us:
+**Candidates**, at the four A1 points. The targets (baseline / 1.6) are
+177.1 us (c140_mean), 177.2 us (c150_mean), 188.0 us (c150_p90) and 192.5 us
+(c140_p90). Each candidate is priced as a fixed term plus weight streaming
+(amd-e2e-lowering: bytes / bandwidth + visibility latency + sync, from a
+measurement on this node):
 
 | id | change | predicted time | predicted gain | basis |
 |---|---|---|---|---|
 | K1 | SwiGLU-OAI GEMM1 epilogue (`act.swiglu_mul_batch`: alpha 1.702, up + 1, clamps at 7), fp32 before the MXFP8 quant | +0..2 us | 1.00x | elementwise on accumulators; required for B2 to be correct |
-| K2 | fused small-input route for the M3.1 EP4 layout: dispatch, GEMM1, K1's epilogue, GEMM2 and combine in the fused kernels | ~166 us at both points | 1.70x / 1.85x (1.5x if it keeps only V4.1's staged-to-fused ratio) | measured analog, below |
-| K3 | tile / persist-CU / grid tuning of K2's kernels | to the ~145 us floor at 6.6 TB/s | up to 1.95x / 2.1x | only if K2 lands short |
+| K2 | fused small-input route for the M3.1 EP4 layout: dispatch, GEMM1, K1's epilogue, GEMM2 and combine in the fused kernels | 60 + 962 MB / 7.3 TB/s = 191.6 us at 104 rows; 59 + 962 MB / 7.0 TB/s = 196.4 us at 144-152 rows | 1.48x, 1.48x, 1.53x, 1.57x: short at every point | the V4.1 fit below |
+| K3 | tuning of K2's kernels (tiles, persistent CUs, the dispatch and combine phases) that cuts the fixed term | fixed term at most 45.6 / 45.7 / 50.5 / 55.0 us at today's streaming rate | 1.6x where it gets there | required, not conditional; its gain is the Low confidence entry |
 | K3' | tune the staged route alone | ~266 / ~274 us | 1.06x / 1.12x | stage1 + stage2 at 5.8 TB/s; prepare + combine stay |
 
-The analog: on the same node, aiter's own routes suite at the
-DeepSeek-V4.1-Flash EP4 layout (`test_mega_moe_v2.py --suite routes --network
-v41_flash --time-only --max-tok-per-rank 512`) times the fused small-input
-route at 1.49x-1.57x the staged route for 32-256 rows per rank, and streams
-about 5.8 TB/s (1.8 GB of weights in 311 us at 104 rows). At 5.8 TB/s the
-M3.1 weight floor is about 166 us. M3.1's staged route already streams
-faster than V4.1's (4.7 vs 3.7 TB/s), so the ratio alone understates K2; the
-floor estimate overstates it if the port does not reach V4.1's bandwidth.
+The fit: aiter's routes suite at the DeepSeek-V4.1-Flash layout
+(`test_mega_moe_v2.py --suite routes --network v41_flash --time-only
+--max-tok-per-rank 512`, the same image on g52) times the fused small-input
+route at EP4 (96 experts and 1.80 GB of weights per rank) and EP2 (192
+experts, 3.61 GB) at the same rows per rank:
+
+| rows / rank | EP4 fused (us) | EP2 fused (us) | streaming rate | fixed term |
+|---|---|---|---|---|
+| 104 | 306.7 | 553.3 | 7.3 TB/s | 60.1 us |
+| 152 | 316.8 | 574.7 | 7.0 TB/s | 58.9 us |
+
+At these row counts nearly every local expert receives rows on both layouts, so the
+EP2 - EP4 difference is 1.80 GB of extra weights; what remains of the EP4 time
+is the fixed term (launch, dispatch, cross-rank waits, pipeline fill and
+drain, combine). The EP4 fixed term is the one M3.1 inherits, since M3.1 is
+EP4 too; the V4.1 EP8 layout carries M3.1's bytes per rank but an 8-rank
+exchange, so it would not price the fixed term more directly. M3.1's top-4
+moves fewer dispatch and combine bytes than V4.1's top-6 (about 0.8x per
+row), which can only shrink its fixed term. The streaming rate is near
+MI355X's HBM peak, so K3's room is in the fixed term: at the mean points it
+has to fall from about 60 us to 46 us. The fused / staged ratio of this run
+is 1.58x and 1.59x at 104 and 152 rows (raw logs in
+`/share_nfs/mengqing/code/tmp/m31-decode-dep4/15/reprice/runs/`).
 
 K2 is kernel work, not a table entry. Admitting the layout to
 `FUSED_LAYOUTS` fails at build: `mega_moe_small_m._use_direct_fixed_slot`
@@ -221,9 +242,11 @@ the same route because the choice reads only the DP-group max rows.
 
 ## ATOM integration gaps
 
-Checked at `fork/mengqing/m31-decode-dep4` e60dd5d.
-`git log fork/mengqing/m31-decode-dep4..origin/main` shows no upstream change
-to these files, so none is a sync.
+Checked at `fork/mengqing/m31-decode-dep4` e60dd5d. In
+`git log fork/mengqing/m31-decode-dep4..origin/main` (origin/main c039e2974
+fetched 2026-11-24), the only commit touching the files below is aec84b14b,
+which adds the `disable_custom_all_reduce` option to `atom/config.py` and
+leaves `indexer_cp_unsupported_reason` alone, so none of these gaps is a sync.
 
 **B1 and B2**
 
@@ -248,24 +271,44 @@ to these files, so none is a sync.
 
 - `MegaFusedExperts.__call__` refuses `ActivationType.Swiglu`: pass T1's
   SwiGLU-OAI activation with M3.1's `swiglu_alpha` and `swiglu_limit`, and key
-  `_get_mega`'s cache on them.
+  `get_or_build_mega_moe`'s cache on them.
 - Build `MegaMoEV2(routed=True)` and pass `max_tokens` = the DP group's
   largest rank's rows (`DPMetadata`), so all ranks take the same route: the
-  routing half of ROCm/ATOM#3187. M3.1 runs its shared expert inline in
-  `atom/models/minimax_m3/model.py`, so #3187's single-stream gating is not
-  needed.
+  routing half of ROCm/ATOM#3187 (D7 says why only that half).
+- Run MegaMoE only on steps where arm A's MoE would quantize activations to
+  MXFP4, and B1's path on the rest (Numerics, below).
 - Pass `stage2_p2p_quant="none"`: the combine wire stays bf16 even when a
   larger `--max-num-batched-tokens` pushes MTPR to 1024.
 - Launch: `--max-num-batched-tokens 512` per rank (MTPR is a power of two;
   64 requests per rank at k=7, the same as the DP + drafter graph cap
   `ATOM_TOKEN_GRAPH_DP_MAX_TOKENS`).
 
-**Numerics** (overlay): MegaMoE quantizes activations to MXFP8 (a8w4,
-`MegaMxfp4MoEMethod`). Arm A's fused_moe runs MXFP4 activations at 256 rows
-and above (aiter `resolve_activation_dtype`, through
-`Mxfp4MoEMethod.activation_dtype`), and A runs 400+ rows at the A1 points, so
-B2 is no lower there. Below 32 decoding requests A runs bf16 and B2's MXFP8 is
-lower: T3 reports the share of such steps per run.
+**Numerics** (overlay: MoE "never moved to a lower-precision path"; #14 Goal
+2: B2 "at A's numerics"). MegaMoEV2 has only a4w4 and a8w4, so B2's MegaMoE
+quantizes activations to MXFP8. Arm A's fused_moe picks its activation dtype
+from its row count (aiter `resolve_activation_dtype`, through
+`Mxfp4MoEMethod.activation_dtype`): bf16 below 256 rows, MXFP4 at 256 and
+above. MXFP8 is above MXFP4 and below bf16, so B2 may run MegaMoE only on
+steps where A would run MXFP4:
+
+- The choice reads `sum(running_tokens_across_dp)` of the forward `Context`, the DP
+  group's running rows. That is the count A's MoE sees for the same requests,
+  and the count B1's fused_moe runs on (`FusedMoEModularKernel` trims MoRI's
+  dispatch to it), so the choice is the same on every rank and as static
+  under graph capture as B1's own dtype choice.
+- MegaMoE runs when `activation_dtype(layer, that count)` is MXFP4; otherwise
+  the step takes B1's path, MoRI dispatch / combine around fused_moe, whose
+  activations are then bf16 like A's. This is the rule `--moe-backend mega`
+  already applies under sequence parallelism
+  (`atom/model_ops/fused_moe/sp_mega_moe.py: SPMegaMoE.runs`: "only where the
+  native MoE quantizes activations to FP4 too").
+- At the A1 points the group runs 400-600 rows, so MegaMoE serves them; the
+  fallback serves steps with fewer than 32 decoding requests in the group.
+- Cost: `MegaMxfp4MoEMethod._process_weight_layout_after_loading` releases
+  the native weights today. B2 keeps them for the fallback, about 0.96 GB per
+  MoE layer per rank (55 GB over M3.1's 57 MoE layers), and builds MoRI's
+  prepare / finalize next to MegaMoE. T2 reports the KV capacity left and
+  escalates if the p90 decode batch no longer fits.
 
 ## Decisions
 
@@ -273,12 +316,37 @@ lower: T3 reports the share of such steps per run.
 |---|---|---|---|
 | D1 | Baseline is aiter `62cb8decf`, measured with the image's identical `aiter/ops/flydsl/` | code: first-parent main before #14's creation; `git diff 82b6b4f19 62cb8decf -- aiter/ops/flydsl/` empty | the image's aiter as the named baseline: not "main at the umbrella's start" |
 | D2 | The baseline runs clamped SiLU at limit 7; each op is checked against its own activation's fp32 reference | code: `gemm_util.py` act check; principle: overlay, "no worse versus fp32 than the code it replaces" | a requirement-gap ruling: the requirement fixes op, commit and shapes; only an activation aiter lacks is missing, and the closest one is the conservative timing |
-| D3 | A1 points from prior telemetry, plus a 4-40 request sweep; A1 reruns at T3's measured points | reference: cost-model telemetry and DP replay | one fixed point each: tunes for a batch the target stack may not run |
+| D3 | A1 points from prior telemetry, plus a 4-40 request sweep; T3 reruns A1 at its measured points | reference: cost-model telemetry and DP replay | one fixed point each: tunes for a batch the target stack may not run |
 | D4 | Real routing by capture from an arm-A decode window | code: `FusedMoE.forward_impl`, `FusedMoE.select_experts` | aiter's synthetic or Zipf routing: hides EP imbalance; the requirement asks for real routing |
-| D5 | K1 then K2; K3 only if K2 is short of 1.6x; stop at 1.6x | measured attribution and analog above; principle: e2e-lowering, fuse edges whose dependency is a counter | K3' alone: leaves prepare + combine, at most 1.12x |
+| D5 | K1, then K2, then K3 on K2's fixed term; stop at 1.6x | measured attribution and the V4.1 fixed + streaming fit above; principle: e2e-lowering, fuse edges whose dependency is a counter | K3' alone: leaves prepare + combine, at most 1.12x |
 | D6 | ATOM passes `stage2_p2p_quant="none"` explicitly | code: `P2P_FP8_MIN_MTPR`; overlay bans an FP8 combine wire | relying on MNBT <= 512: one launch flag away from a banned wire |
-| D7 | Port only the routing half of #3187 | code: no side stream in `minimax_m3/model.py` | the whole PR: its large-input route and side-stream gating serve DeepSeek layouts |
+| D7 | Port only the routing half of #3187: `routed=True` and `max_tokens` = DP-group max rows | code: the half that serves M3.1 decode; see the note below | the whole PR: its other parts do not reach M3.1 decode |
+| D9 | B2 runs MegaMoE only where A's MoE runs MXFP4 activations, B1's path elsewhere | code: `Mxfp4MoEMethod.activation_dtype`, `SPMegaMoE.runs`; principle: overlay numerics rule | MegaMoE on every step: MXFP8 below A's bf16 on small steps, which the overlay forbids |
 | D8 | Three tasks: operator, ATOM integration, 1P1D report | overlay `max_tasks` 3, `split_loc` 1000 | B1 enablement as its own task: a fourth task in the files B2 also edits |
+
+**D7, what #3187 holds and what M3.1 decode needs.** ROCm/ATOM#3187 (open)
+needs ROCm/aiter#7788, which aiter main already carries (49ec5a31f, an
+ancestor of the baseline `62cb8decf`). Its parts:
+
+- `MegaMoEV2(routed=True)` with the DP-group max rows as `max_tokens`, and
+  skipping the 128-row decode instance where the small-input route covers it.
+  Ported: this is what lets T1's fused route serve B2's decode steps.
+- The large-input route and its per-layer state slots. Not ported: aiter
+  builds that route only for `FUSED_LAYOUTS` at the capacities
+  `mega_moe_config.large_m_mtprs_for` gives (DeepSeek-V4-Pro EP8 and
+  DeepSeek-V4.1-Flash EP2 / EP4 / EP8), and #3187 never captures it in a CUDA
+  graph. B2's decode steps run in graphs at no more than 512 rows per rank,
+  the small-input route's range, and T1 admits the M3.1 layout to that route
+  only.
+- `allows_concurrent_shared_stream`, because MegaMoEV2's persistent kernels
+  deadlock beside a side-stream kernel. #3187 uses it to gate the shared-expert
+  dual stream of `deepseek_v2.py`, `deepseek_v4` and `kimi_k3/model.py`. Not
+  ported: `atom/models/minimax_m3/model.py: MiniMaxM3MoE.forward` adds the
+  shared expert's output on the current stream, and nothing under
+  `atom/models/minimax_m3/` creates a side stream (its only stream references
+  are kernel launches on the caller's current stream).
+- Refusing `--moe-backend mega` with `-tp > 1` and no
+  `--enable-dp-attention`. Not ported: B2 always runs with DP attention.
 
 ## Simpler alternative
 
@@ -288,14 +356,19 @@ only the staged route (K3') reaches at most 1.06x-1.12x and fails A1 too.
 
 ## Low confidence
 
-None. K2's gain is a prediction (1.5x-1.85x at the A1 points); T1 measures
-it, and D5's order does not depend on it. If K2 plus K3 cannot reach 1.6x, T1
-escalates with its measurements.
+- **Whether K3 brings K2 to 1.6x.** K2 is priced at 1.48x-1.57x, so A1 rests
+  on K3 cutting the fixed term from about 60 us to 46 us at the mean points
+  (55 us at c140_p90). No measurement before the port can settle it: the
+  M3.1 fused route's fixed term exists only once K2 is built, and K2 is most
+  of T1, so a spike would build it twice. D5's order does not depend on the
+  answer. T1 measures K2 first; if K2 plus K3 cannot reach 1.6x, T1 escalates
+  with its measurements.
 
 ## Dependencies
 
 No spike: the operator's gain can only be measured on the port itself, which
-is T1. No sync issue: upstream has no change to the affected files.
+is T1 (Low confidence). No sync issue: upstream has no change to the affected
+code paths (ATOM integration gaps).
 
 ## Summary
 
@@ -305,7 +378,7 @@ is T1. No sync issue: upstream has no change to the affected files.
   it). K1 SwiGLU-OAI epilogue in `mega_moe/gemm_util.py` (and the fused
   route's GEMM1 store), exposed as a MegaMoEV2 `act` with alpha and limit; K2
   the fused small-input route for `(4, 6144, 3072, 128, 4)`
-  (`mega_moe_small_m.py`, `mega_moe_config.py`); K3 only if needed;
+  (`mega_moe_small_m.py`, `mega_moe_config.py`); K3 on its fixed term;
   `op_tests/multigpu_tests/bench_mega_moe_m31.py` (this bench, taking the
   capture directory); a routes-suite network entry for M3.1. Named result:
   A1's table, baseline vs tuned at the A1 points, layers 3/20/40/59, with
@@ -315,15 +388,20 @@ is T1. No sync issue: upstream has no change to the affected files.
   T1's interface). `atom/models/minimax_m3/dspark.py` (TP1 draft),
   `atom/config.py` (indexer CP refusal under DP attention),
   `atom/model_ops/fused_moe/flydsl_mega_experts.py` (activation, routed /
-  `max_tokens`, bf16 wire), CPU tests in `tests/`. Named result: B1 and B2
-  start at DEP4 with DSpark k=7 and give GSM8K-200 and acceptance length
-  within A2's bounds of A, through P/D. Estimate: about 250 code, 200 tests.
+  `max_tokens`, bf16 wire), `atom/model_ops/moe.py: MegaMxfp4MoEMethod`
+  (keep the native weights and MoRI, choose MegaMoE or B1's path per step as
+  Numerics says), CPU tests in `tests/`. Named result: B1 and B2 start at
+  DEP4 with DSpark k=7 and give GSM8K-200 and acceptance length within A2's
+  bounds of A, through P/D; B2's KV capacity with both weight copies.
+  Estimate: about 350 code, 300 tests.
 - **T3 1P1D verdict** (depends on T1 and T2). Launch scripts and report under
   `/share_nfs/mengqing/code/tmp/m31-decode-dep4/<issue>/`, on the optimized
   prefill stack; A, B1, B2 at c140 and c150, 2+ runs per point, the metrics
   A3 lists, the per-layer breakdown of the top two arms, the decode batch per
-  point, and the second agent's rerun. Named result: A3's report. Estimate: no
-  tree code.
+  point, and the second agent's rerun. It also reruns T1's recorded A1
+  command at the per-rank rows its B2 runs measured, and escalates on #14 if
+  any point is below 1.60x. Named result: A3's report with that A1 rerun.
+  Estimate: no tree code.
 
 **Scope**: the decode instance on 4 GPUs in 1P1D; the operator on gfx950 at
 EP4. **Non-goals**: the requirement's (aggregated serving, ATOMesh policy,

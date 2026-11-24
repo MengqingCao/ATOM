@@ -382,6 +382,11 @@ changing worker metric names.
 policies and branches that record it, how to read the values, and example
 queries.
 
+[Prefill charge](docs/prefill_charge.md) designs how each single-worker path
+charges `mesh_worker_prefill_tokens` and what releases the charge.
+
+[Mesh principles](docs/principles.md) are the project's design principles.
+
 ### Logging
 
 Structured logging via `tracing`, optional file sink (`--log-dir`), and log level (`--log-level`).

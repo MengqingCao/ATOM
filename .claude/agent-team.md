@@ -3,7 +3,7 @@
 repo: MengqingCao/ATOM
 integration_branch: mesh-vllm-load
 never_touch: ROCm/ATOM
-# CLAUDE.md has no mesh command; CI (.github/workflows/atomesh-mocker-benchmark.yaml) runs these.
+# CLAUDE.md has no mesh command. fmt is atom/mesh/.pre-commit-config.yaml's; lib tests are CI's minus --features atom-engine; the test compile is the gate's own.
 gate_task: cd atom/mesh && cargo fmt --check && cargo test --lib && cargo test --tests --no-run
 design_entry: atom/mesh/README.md
 new_tests_dir: atom/mesh/tests

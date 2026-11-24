@@ -26,7 +26,9 @@ mapfile -t TESTS < <(
     printf '%s\n' "${PYFILES[@]}" | grep -E '^tests/(.*/)?test_[^/]*\.py$' | grep -v '^tests/plugin/'
     for f in "${PYFILES[@]}"; do
         case "$f" in atom/*.py) m=${f%.py}; m=${m%/__init__}; m=${m//\//.}
-            grep -rlE --include='test_*.py' "(from|import) ${m//./\\.}([ .]|$)" tests 2>/dev/null | grep -v '^tests/plugin/' ;;
+            grep -rlE --include='test_*.py' "(from|import) ${m//./\\.}([ .]|$)" tests 2>/dev/null | grep -v '^tests/plugin/'
+            # `from <parent> import <leaf>` (also parenthesized): any file with both; over-selection is safe.
+            p=${m%.*}; grep -rlE --include='test_*.py' "from ${p//./\\.} import" tests 2>/dev/null | grep -v '^tests/plugin/' | xargs -r grep -lw "${m##*.}" ;;
         esac
     done | sort -u
 )

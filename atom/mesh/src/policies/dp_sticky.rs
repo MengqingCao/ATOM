@@ -821,6 +821,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stale_failure_on_the_rank_the_new_binding_maps_to_keeps_it() {
+        let policy = DpStickyPolicy::new();
+        let ranks = dp_workers();
+        let headers = headers("session-1");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        // A request placed on rank 0 is still running there when the
+        // session fails on rank 0 and is placed again on rank 1.
+        let (_, stale) = policy.select_with_decision(&ranks, &info).await;
+        policy.on_dispatch("prefill", Some(&headers), &ranks[0], stale.binding);
+        policy.on_dispatch_failed(Some(&headers), &ranks[0], stale.binding);
+        let (selected, current) = policy.select_with_decision(&ranks, &info).await;
+        assert_eq!(selected, Some(1));
+        // Rank mapping sends the current request to rank 0, then the stale
+        // request fails there.
+        policy.on_dispatch("prefill", Some(&headers), &ranks[0], current.binding);
+        policy.on_dispatch_failed(Some(&headers), &ranks[0], stale.binding);
+
+        let (selected, decision) = policy.select_with_decision(&ranks, &info).await;
+        assert_eq!((selected, decision.branch), (Some(1), "hit"));
+    }
+
+    #[tokio::test]
     async fn missing_session_id_uses_load_balancing_fallback() {
         let policy = DpStickyPolicy::new();
         let workers = workers();

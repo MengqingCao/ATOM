@@ -41,7 +41,7 @@ flowchart LR
   attn --> gate["router: sigmoid + bias, top-4"]
   gate --> pick{"DP group's running rows<br/>>= A's MXFP4 threshold?"}
   pick -->|yes| mega["MegaFusedExperts: MegaMoEV2<br/>routed, max_tokens = DP-group max rows<br/>act swigluoai, alpha 1.702, limit 7<br/>MXFP8 activations, combine wire bf16"]
-  pick -->|no| mori["B1 path: MoRI dispatch / combine<br/>around fused_moe, bf16 activations"]
+  pick -->|no| mori["B1 path: MoRI dispatch / combine<br/>around fused_moe on MegaMoE's weights<br/>(gate-up interleaved), bf16 activations"]
   attn --> shared["shared expert: own MXFP8 MLP"]
   mega --> sum["routed + shared"]
   mori --> sum
@@ -296,19 +296,34 @@ steps where A would run MXFP4:
   and the count B1's fused_moe runs on (`FusedMoEModularKernel` trims MoRI's
   dispatch to it), so the choice is the same on every rank and as static
   under graph capture as B1's own dtype choice.
-- MegaMoE runs when `activation_dtype(layer, that count)` is MXFP4; otherwise
-  the step takes B1's path, MoRI dispatch / combine around fused_moe, whose
-  activations are then bf16 like A's. This is the rule `--moe-backend mega`
-  already applies under sequence parallelism
-  (`atom/model_ops/fused_moe/sp_mega_moe.py: SPMegaMoE.runs`: "only where the
-  native MoE quantizes activations to FP4 too").
+- MegaMoE runs when A's `activation_dtype` for that count is MXFP4, computed
+  with A's separated gate mode; otherwise the step takes B1's path, MoRI
+  dispatch / combine around fused_moe, whose activations are then bf16 like
+  A's. That fused_moe reads MegaMoE's own weights with `gate_mode` INTERLEAVE
+  (cost, below). This is the rule `--moe-backend mega` already applies under
+  sequence parallelism (`atom/model_ops/fused_moe/sp_mega_moe.py:
+  SPMegaMoE.runs`: "only where the native MoE quantizes activations to FP4
+  too").
 - At the A1 points the group runs 400-600 rows, so MegaMoE serves them; the
   fallback serves steps with fewer than 32 decoding requests in the group.
-- Cost: `MegaMxfp4MoEMethod._process_weight_layout_after_loading` releases
-  the native weights today. B2 keeps them for the fallback, about 0.96 GB per
-  MoE layer per rank (55 GB over M3.1's 57 MoE layers), and builds MoRI's
-  prepare / finalize next to MegaMoE. T2 reports the KV capacity left and
-  escalates if the p90 decode batch no longer fits.
+- Cost: no second weight copy. On gfx950 MegaMoE's weights are fused_moe's
+  gate-up-interleave layout: `flydsl_mega_experts.py: build_mega_weights`
+  calls aiter `shuffle_weight_a16w4` / `shuffle_scale_a16w4`, which are
+  `shuffle_weight` / `shuffle_scale` with `is_guinterleave=True` and layout
+  (16, 16), the bytes `moe_shuffle_weight` / `moe_shuffle_scale` write for
+  `Mxfp4MoEMethod` under `ATOM_MOE_GU_ITLV=1`. For Swiglu with that layout,
+  aiter `resolve_activation_dtype` gives bf16 below 256 rows, so the fallback
+  runs at A's numerics. Measured on one MI355X (image
+  `rocm/atom-dev:nightly_202611211511`, aiter 9f3cba25e, an ancestor of the
+  baseline; aiter's own `test_fmoe` at hidden 6144, inter 3072, 32 local
+  experts, top-4, Swiglu, limit 7, bf16 activations, 4 to 255 rows): the
+  interleaved kernel runs, its logits_diff versus the fp32-intermediate
+  reference is about 6e-6 against the separated layout's 1.9e-5, and its time
+  is within 3.3% of separated at 4-16 rows and 4-10% below it at 32-255 rows
+  (408 vs 429 us at 255; five timed calls per point). Neither layout has a
+  tuned row at these shapes (aiter's `minimax_m3_*` tables cover the TP
+  shapes, inter 768 and 1536 over 128 experts): both run the 2-stage defaults.
+  B2 builds MoRI's prepare / finalize next to MegaMoE, which holds no weights.
 
 ## Decisions
 
@@ -321,7 +336,7 @@ steps where A would run MXFP4:
 | D5 | K1, then K2, then K3 on K2's fixed term; stop at 1.6x | measured attribution and the V4.1 fixed + streaming fit above; principle: e2e-lowering, fuse edges whose dependency is a counter | K3' alone: leaves prepare + combine, at most 1.12x |
 | D6 | ATOM passes `stage2_p2p_quant="none"` explicitly | code: `P2P_FP8_MIN_MTPR`; overlay bans an FP8 combine wire | relying on MNBT <= 512: one launch flag away from a banned wire |
 | D7 | Port only the routing half of #3187: `routed=True` and `max_tokens` = DP-group max rows | code: the half that serves M3.1 decode; see the note below | the whole PR: its other parts do not reach M3.1 decode |
-| D9 | B2 runs MegaMoE only where A's MoE runs MXFP4 activations, B1's path elsewhere | code: `Mxfp4MoEMethod.activation_dtype`, `SPMegaMoE.runs`; principle: overlay numerics rule | MegaMoE on every step: MXFP8 below A's bf16 on small steps, which the overlay forbids |
+| D9 | B2 runs MegaMoE only where A's MoE runs MXFP4 activations, B1's path elsewhere, over MegaMoE's own interleaved weights | code: `Mxfp4MoEMethod.activation_dtype`, `SPMegaMoE.runs`, `build_mega_weights`, aiter `shuffle_weight_a16w4`; measured interleaved bf16 fused_moe at M3.1's EP4 shapes (Numerics, cost); principle: overlay numerics rule | MegaMoE on every step: MXFP8 below A's bf16 on small steps, which the overlay forbids; keeping a separated-layout copy for the fallback: about 55 GB per rank for no gain in accuracy or time |
 | D8 | Three tasks: operator, ATOM integration, 1P1D report | overlay `max_tasks` 3, `split_loc` 1000 | B1 enablement as its own task: a fourth task in the files B2 also edits |
 
 **D7, what #3187 holds and what M3.1 decode needs.** ROCm/ATOM#3187 (open)
@@ -347,6 +362,11 @@ ancestor of the baseline `62cb8decf`). Its parts:
   are kernel launches on the caller's current stream).
 - Refusing `--moe-backend mega` with `-tp > 1` and no
   `--enable-dp-attention`. Not ported: B2 always runs with DP attention.
+- The PCP-merge hint (`_pcp_merged_rows`: under `pcp_merge` the hint is the
+  step's rows padded to a PCP multiple). Not ported: B2's decode runs no PCP.
+- `in_hipgraph` set in `drafter.py: _warmup_draft_graphs`, so a captured
+  draft pass's warmup hints the route its recording launches. Not ported:
+  the M3.1 DSpark draft has no MoE layer.
 
 ## Simpler alternative
 
@@ -389,10 +409,11 @@ code paths (ATOM integration gaps).
   `atom/config.py` (indexer CP refusal under DP attention),
   `atom/model_ops/fused_moe/flydsl_mega_experts.py` (activation, routed /
   `max_tokens`, bf16 wire), `atom/model_ops/moe.py: MegaMxfp4MoEMethod`
-  (keep the native weights and MoRI, choose MegaMoE or B1's path per step as
-  Numerics says), CPU tests in `tests/`. Named result: B1 and B2 start at
-  DEP4 with DSpark k=7 and give GSM8K-200 and acceptance length within A2's
-  bounds of A, through P/D; B2's KV capacity with both weight copies.
+  (build MoRI next to MegaMoE, choose MegaMoE or B1's path per step as
+  Numerics says, and run B1's fused_moe on MegaMoE's weights with `gate_mode`
+  INTERLEAVE; no second weight copy), CPU tests in `tests/`. Named result:
+  B1 and B2 start at DEP4 with DSpark k=7 and give GSM8K-200 and acceptance
+  length within A2's bounds of A, through P/D; B2's KV capacity next to B1's.
   Estimate: about 350 code, 300 tests.
 - **T3 1P1D verdict** (depends on T1 and T2). Launch scripts and report under
   `/share_nfs/mengqing/code/tmp/m31-decode-dep4/<issue>/`, on the optimized

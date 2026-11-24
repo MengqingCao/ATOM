@@ -1003,7 +1003,12 @@ impl PDRouter {
             Err(resp) => return resp,
         };
         let decode_result = self
-            .send_worker(decode_post, decode.clone(), placement.decode_binding, headers)
+            .send_worker(
+                decode_post,
+                decode.clone(),
+                placement.decode_binding,
+                headers,
+            )
             .await;
         events::RequestReceivedEvent {}.emit();
 
@@ -1127,9 +1132,7 @@ impl PDRouter {
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
 
-        let prefill_result = self
-            .send_prefill(prefill_post, &placement, headers)
-            .await;
+        let prefill_result = self.send_prefill(prefill_post, &placement, headers).await;
         let prefill_resp = match prefill_result {
             Ok(r) => r,
             Err(e) => {
@@ -1260,7 +1263,12 @@ impl PDRouter {
             Err(resp) => return resp,
         };
         let decode_result = self
-            .send_worker(decode_post, decode.clone(), placement.decode_binding, headers)
+            .send_worker(
+                decode_post,
+                decode.clone(),
+                placement.decode_binding,
+                headers,
+            )
             .await;
         events::RequestReceivedEvent {}.emit();
 
@@ -1880,12 +1888,7 @@ impl PDRouter {
             && prefill.dp_rank().is_some()
             && prefill.dp_rank() == decode.dp_rank();
         let response = self
-            .send_worker(
-                request,
-                prefill.clone(),
-                placement.prefill_binding,
-                headers,
-            )
+            .send_worker(request, prefill.clone(), placement.prefill_binding, headers)
             .await;
         if follows_decode && dispatch_failed(response.as_ref().ok().map(WorkerResponse::status)) {
             self.policy_registry.get_decode_policy().on_dispatch_failed(

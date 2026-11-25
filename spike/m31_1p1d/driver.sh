@@ -21,13 +21,17 @@ clean() {  # this driver's containers only: the current run's launcher job, and 
 }
 finish() {
   trap - EXIT INT TERM HUP
+  kill $TOUCHER 2>/dev/null
   [[ -z $LEASE ]] && { log "END no lease: $why"; exit; }
   clean
   for i in 1 2 3 4 5 6 7 8 9 10; do  # release refuses (rc 3) while GPU memory drains
     $G release "$LEASE" --note "#35 driver: $done_n runs done; $why" && break; sleep 30
   done
-  log "END released $LEASE on $NODE: $why"
+  : > $S/driver_lease; log "END released $LEASE on $NODE: $why"
 }
+# CPU-only phases (image prep, Store compaction, reports) leave the GPUs empty: reset the idle clock every 10 min.
+( while sleep 600; do l=$(cat $S/driver_lease 2>/dev/null); [[ -n $l ]] && $G touch "$l" >/dev/null 2>&1; done ) &
+TOUCHER=$!
 trap finish EXIT; trap 'why="driver killed"; exit 1' INT TERM HUP
 
 # Foreign GPU users on $HOST, one line each ("container NAME (ID)" or "pid P uid U"); empty = clean.
@@ -54,7 +58,7 @@ grant() {
     echo "$out"
     LEASE=$(grep -o 'L[0-9a-f]\{6\}' <<<"$out" | head -1); HOST=$(grep -o 'pit2-p03-g[0-9]*' <<<"$out" | head -1); NODE=${HOST#pit2-p03-}
     [[ -n $LEASE && -n $NODE ]] || { why="cannot parse grant: $out"; exit 1; }
-    log "GRANTED $LEASE $HOST"
+    echo "$LEASE" > $S/driver_lease; log "GRANTED $LEASE $HOST"
     if ! ssh "$HOST" docker image inspect "$IMG" >/dev/null 2>&1; then
       $G touch "$LEASE"; log "prep_image.sh $NODE"; bash "$D/prep_image.sh" "$NODE" || { why="prep_image failed"; exit 1; }
     fi
@@ -71,7 +75,7 @@ drop() {
   log "BUSY $NODE $LEASE: gpus busy by foreign process: $1"
   clean
   $G release "$LEASE" --force --note "#35 driver: GPUs busy with a foreign unleased process ($1), nothing of ours ran; re-queuing elsewhere"
-  log "END released $LEASE on $NODE: foreign process"; bad="$bad $NODE"; LEASE=
+  : > $S/driver_lease; log "END released $LEASE on $NODE: foreign process"; bad="$bad $NODE"; LEASE=
 }
 log "CONFIG #35 ruling 7167528921, all arms: prefill KV CPU tier = Mooncake Store 2 TiB host DRAM (MOONCAKE_STORE=1, owners 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7; ATOM_KV_OFFLOAD=mooncake_store via launcher; decode no tier); ruling 7164687062: decode DP session affinity off (no dp_sticky/--dp-aware/X-Session-ID; router policy random), AgentX warmup_requests_per_lane=1 (was 10), window 1200 s, warmup_grace_period 1800 s; watchdog agentx duration+${WD_MARGIN:-1800} s, gsm8k 3600 s"
 grant

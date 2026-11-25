@@ -1,0 +1,85 @@
+From 4b2978d14ff6a666adfa54abb5440d382dcabe05 Mon Sep 17 00:00:00 2001
+From: "mengqing.cao@amd.com" <cmq0113@gmail.com>
+Date: Wed, 25 Nov 2026 17:14:12 +0000
+Subject: [PATCH] atomesh: compact each NUMA node for its pins plus
+ min(reserve, pins/16)
+
+A node whose page cache must be reclaimed gives a few GiB of 4 KiB pages
+(pit2-p03-g48, #35 B2-c150-r1: 1017 of 1024 GiB huge on NUMA 1); the last
+Mooncake Store owner to fault takes them and its ionic NIC refuses the MR
+(ENOMEM, register_local_memory_failed -202). The margin leaves a full set of
+free huge pages for the owners.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ .github/scripts/atomesh/numa_memory_budget.py | 16 ++++++++++++----
+ tests/test_atomesh_numa_memory_budget.py      |  6 ++++++
+ 2 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/.github/scripts/atomesh/numa_memory_budget.py b/.github/scripts/atomesh/numa_memory_budget.py
+index 6b72463e1..16c722337 100755
+--- a/.github/scripts/atomesh/numa_memory_budget.py
++++ b/.github/scripts/atomesh/numa_memory_budget.py
+@@ -210,13 +210,20 @@ def main(argv: list[str] | None = None) -> int:
+     planned = plan_pins(args.pins, args.gpus, args.per_gpu_gib, args.sysfs)
+     status = check_budget(planned, args.reserve_gib, args.sysfs)
+     if status == 0 and args.compact:
+-        compact_nodes(planned, args.compact_timeout)
++        compact_nodes(planned, args.compact_timeout, args.reserve_gib)
+     return status
+ 
+ 
+-def compact_nodes(planned: dict[int, float], timeout: float = 600.0) -> None:
++def compact_nodes(
++    planned: dict[int, float], timeout: float = 600.0, reserve_gib: float = 0.0
++) -> None:
+     """Compact each node for its pins: compact_huge_pages.py bound to the node.
+ 
++    Each node is compacted for its pins plus min(reserve, pins / 16): a node
++    whose page cache must be reclaimed gives a few GiB as 4 KiB pages
++    (pit2-p03-g48: 1017 of 1024 GiB huge), which the last owner to fault then
++    takes and its ionic NIC refuses to register.
++
+     One node at a time, each stopped after ``timeout`` seconds; a failure or a
+     timeout only warns, since the pins' owners check their own pages.
+     """
+@@ -224,8 +231,9 @@ def compact_nodes(planned: dict[int, float], timeout: float = 600.0) -> None:
+     for node in sorted(planned):
+         if planned[node] <= 0:
+             continue
++        gib = planned[node] + min(reserve_gib, planned[node] / 16)
+         print(
+-            f"[numa-budget] compacting NUMA node {node} for {planned[node]:.0f} GiB",
++            f"[numa-budget] compacting NUMA node {node} for {gib:.0f} GiB",
+             flush=True,
+         )
+         try:
+@@ -237,7 +245,7 @@ def compact_nodes(planned: dict[int, float], timeout: float = 600.0) -> None:
+                     str(node),
+                     sys.executable,
+                     str(here / "compact_huge_pages.py"),
+-                    f"{planned[node]:g}",
++                    f"{gib:g}",
+                 ],
+                 check=False,
+                 timeout=timeout,
+diff --git a/tests/test_atomesh_numa_memory_budget.py b/tests/test_atomesh_numa_memory_budget.py
+index b9501db09..c312b2990 100644
+--- a/tests/test_atomesh_numa_memory_budget.py
++++ b/tests/test_atomesh_numa_memory_budget.py
+@@ -180,6 +180,12 @@ class NumaMemoryBudgetTest(unittest.TestCase):
+         )
+         self.assertEqual(self.timeouts, [600.0, 600.0])
+ 
++    def test_compact_adds_a_margin_of_the_reserve_up_to_a_sixteenth(self):
++        _, calls = self.compact("--reserve-gib", "128", "0:1024", "1:960")
++        self.assertEqual([cmd[-1] for cmd in calls], ["1088", "1020"])
++        _, calls = self.compact("--reserve-gib", "8", "0:1024")
++        self.assertEqual([cmd[-1] for cmd in calls], ["1032"])
++
+     def test_a_compaction_that_overruns_is_stopped_and_only_warns(self):
+         stderr = io.StringIO()
+         with contextlib.redirect_stderr(stderr):
+-- 
+2.43.0
+

@@ -39,7 +39,7 @@ flowchart LR
 flowchart LR
   req["P/D decode step, DP rank r<br/>(its own requests, 8 verify rows each)"] --> attn["attention at TP1"]
   attn --> gate["router: sigmoid + bias, top-4"]
-  gate --> pick{"DP group's running rows<br/>>= A's MXFP4 threshold?"}
+  gate --> pick{"DP group's padded rows<br/>>= the MXFP4 threshold?"}
   pick -->|yes| mega["MegaFusedExperts: MegaMoEV2<br/>routed, max_tokens = DP-group max rows<br/>act swigluoai, alpha 1.702, limit 7<br/>MXFP8 activations, combine wire bf16"]
   pick -->|no| mori["B1 path: MoRI dispatch / combine<br/>around fused_moe on MegaMoE's weights<br/>(gate-up interleaved), bf16 activations"]
   attn --> shared["shared expert: own MXFP8 MLP"]
@@ -276,8 +276,8 @@ leaves `indexer_cp_unsupported_reason` alone, so none of these gaps is a sync.
 - Build `MegaMoEV2(routed=True)` and pass `max_tokens` = the DP group's
   largest rank's rows (`DPMetadata`), so all ranks take the same route: the
   routing half of ROCm/ATOM#3187 (D7 says why only that half).
-- Run MegaMoE only on steps where arm A's MoE would quantize activations to
-  MXFP4, and B1's path on the rest (Numerics, below).
+- Run MegaMoE only on steps where B1's fused_moe would quantize activations
+  to MXFP4, and B1's path on the rest (Numerics, below).
 - Pass `stage2_p2p_quant="none"`: the combine wire stays bf16 even when a
   larger `--max-num-batched-tokens` pushes MTPR to 1024.
 - Launch: `--max-num-batched-tokens 512` per rank (MTPR is a power of two;
@@ -290,23 +290,45 @@ quantizes activations to MXFP8. Arm A's fused_moe picks its activation dtype
 from its row count (aiter `resolve_activation_dtype`, through
 `Mxfp4MoEMethod.activation_dtype`): bf16 below 256 rows, MXFP4 at 256 and
 above. MXFP8 is above MXFP4 and below bf16, so B2 may run MegaMoE only on
-steps where A would run MXFP4:
+steps where the code it replaces, B1, runs MXFP4:
 
 - The choice reads `sum(running_tokens_across_dp)` of the forward `Context`, the DP
-  group's running rows. That is the count A's MoE sees for the same requests,
-  and the count B1's fused_moe runs on (`FusedMoEModularKernel` trims MoRI's
-  dispatch to it), so the choice is the same on every rank and as static
-  under graph capture as B1's own dtype choice.
+  group's padded rows: on a decode step every rank replays the graph of the
+  busiest rank's bucket, so the sum is 4 x that bucket x 8 rows. It is the
+  count B1's fused_moe runs on (`FusedMoEModularKernel` trims MoRI's dispatch
+  to it), so the choice is the same on every rank, matches B1 on every step,
+  and is as static under graph capture as B1's own dtype choice.
+- It is not the count A sees. A pads the group's true total, one bucket for all
+  its requests; B2 pads per rank. Under the arms' decode capture ladder
+  (below) an even step gives both one dtype, and wherever A runs MXFP4 B2
+  runs MegaMoE. Under the repo default ladder they also part where A runs
+  MXFP4 and no rank reaches 8 requests: at 5 to 7 per rank A pads 20 to 28
+  up to 32 (256 rows, MXFP4) while B2's 160 to 224 rows run bf16, above A.
+  Under either ladder an uneven step can put B2 below A: per-rank requests
+  (8, 1, 1, 1) are 256 padded rows, so B2 runs MegaMoE (MXFP8) and B1 runs
+  MXFP4, while A at 11 requests runs bf16. B2 is never below B1. The true
+  total cannot drive the choice, because a decode graph records one branch
+  per bucket; recording each bucket twice would double the decode graphs. The owner ruled for the
+  padded count on #53 (https://github.com/MengqingCao/ATOM/pull/53#issuecomment-7154894181);
+  T3 reports the share of uneven steps.
 - MegaMoE runs when A's `activation_dtype` for that count is MXFP4, computed
   with A's separated gate mode; otherwise the step takes B1's path, MoRI
   dispatch / combine around fused_moe, whose activations are then bf16 like
-  A's. That fused_moe reads MegaMoE's own weights with `gate_mode` INTERLEAVE
+  B1's. That fused_moe reads MegaMoE's own weights with `gate_mode` INTERLEAVE
   (cost, below). This is the rule `--moe-backend mega` already applies under
   sequence parallelism (`atom/model_ops/fused_moe/sp_mega_moe.py:
   SPMegaMoE.runs`: "only where the native MoE quantizes activations to FP4
   too").
 - At the A1 points the group runs 400-600 rows, so MegaMoE serves them; the
-  fallback serves steps with fewer than 32 decoding requests in the group.
+  fallback serves steps whose busiest rank holds fewer than 8 decoding
+  requests (4 x 8 x 8 = 256 padded rows). A, padding its true total, runs
+  MXFP4 only from 29 requests in the group (bucket 32) under the arms' decode
+  capture ladder (`1..8, 10, 12, 14, 16, 20, 24, 28, 32, ...`, the 1P1D
+  launch scripts' `--cudagraph-capture-sizes`); under the repo default
+  (`EngineArgs.cudagraph_capture_sizes`, `1..8, 16, 32, ...`) it runs MXFP4
+  from 17. The 8-per-rank bound holds under both ladders. All these
+  thresholds assume FULL graph mode, where a decode bucket pads to bucket x 8
+  rows.
 - Cost: no second weight copy. On gfx950 MegaMoE's weights are fused_moe's
   gate-up-interleave layout: `flydsl_mega_experts.py: build_mega_weights`
   calls aiter `shuffle_weight_a16w4` / `shuffle_scale_a16w4`, which are
@@ -337,7 +359,7 @@ steps where A would run MXFP4:
 | D5 | K1, then K2, then K3 on K2's fixed term; stop at 1.6x | measured attribution and the V4.1 fixed + streaming fit above; principle: e2e-lowering, fuse edges whose dependency is a counter | K3' alone: leaves prepare + combine, at most 1.12x |
 | D6 | ATOM passes `stage2_p2p_quant="none"` explicitly | code: `P2P_FP8_MIN_MTPR`; overlay bans an FP8 combine wire | relying on MNBT <= 512: one launch flag away from a banned wire |
 | D7 | Port only the routing half of #3187: `routed=True` and `max_tokens` = DP-group max rows | code: the half that serves M3.1 decode; see the note below | the whole PR: its other parts do not reach M3.1 decode |
-| D9 | B2 runs MegaMoE only where A's MoE runs MXFP4 activations, B1's path elsewhere, over MegaMoE's own interleaved weights | code: `Mxfp4MoEMethod.activation_dtype`, `SPMegaMoE.runs`, `build_mega_weights`, aiter `shuffle_weight_a16w4`; measured interleaved bf16 fused_moe at M3.1's EP4 shapes (Numerics, cost); principle: overlay numerics rule | MegaMoE on every step: MXFP8 below A's bf16 on small steps, which the overlay forbids; keeping a separated-layout copy for the fallback: about 55 GB per rank for no gain in accuracy or time |
+| D9 | B2 runs MegaMoE only where B1's fused_moe, at the DP group's padded rows, runs MXFP4 activations, B1's path elsewhere, over MegaMoE's own interleaved weights | code: `Mxfp4MoEMethod.activation_dtype`, `SPMegaMoE.runs`, `build_mega_weights`, aiter `shuffle_weight_a16w4`; measured interleaved bf16 fused_moe at M3.1's EP4 shapes (Numerics, cost); principle: overlay numerics rule; owner ruling on #53 | MegaMoE on every step: MXFP8 below B1's bf16 on small steps, which the overlay forbids; choosing on the group's true total: a decode graph records one branch per bucket; keeping a separated-layout copy for the fallback: about 55 GB per rank for no gain in accuracy or time |
 | D8 | Three tasks: operator, ATOM integration, 1P1D report | overlay `max_tasks` 3, `split_loc` 1000 | B1 enablement as its own task: a fourth task in the files B2 also edits |
 
 **D7, what #3187 holds and what M3.1 decode needs.** ROCm/ATOM#3187 (open)

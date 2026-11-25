@@ -3,7 +3,8 @@
 #   setsid nohup bash driver.sh > $S/driver.log 2>&1 < /dev/null &
 # acquire (-g 8 --wait) -> smoke B2-c150-r1 -> AgentX matrix (A/B1/B2 x c140/c150 x r1,r2, 1200 s) -> traced runs
 # -> GSM8K-200 (c32, 3 a arm; gsmB2r1 traced) -> A1 rerun (a1.sh, POINTS_EXTRA = B2's per-rank rows).
-# One line a run in $S/driver_status.txt. Stops on the first AgentX run without client data, or on YIELD;
+# One line a run in $S/driver_status.txt. Stops on the first AgentX run without client data (a run past
+# duration + WD_MARGIN s is stopped by the watchdog and counts as invalid), or on YIELD;
 # always cleans its own containers and releases the lease (trap). A node whose GPUs a foreign (unleased) process
 # uses is released with --force and skipped; the queue re-acquires elsewhere, at most MAXTRIES grants in all.
 set -uo pipefail
@@ -75,9 +76,11 @@ yield() { $G mine | grep "$LEASE" | grep -q YIELD; }
 # run SPEC: one batch.sh spec; sets rc, dir; writes the status line. Returns 1 if the run is invalid.
 # A run whose GPUs are (or became) used by a foreign process is skipped, its dir moved to runs-aborted/, and redone on another node.
 run() {
-  local spec=$1 t0 t1 tag kind valid who
+  local spec=$1 t0 t1 tag kind valid who late=
   yield && { why="lease YIELD before '$spec'"; exit 0; }
   set -- ${spec#TRACE=1:}; tag=$1 kind=$3
+  # Watchdog: server start + aiperf warmup + the window must fit in duration + WD_MARGIN s, else the run is stuck.
+  local lim=$((SECONDS + ${WD_MARGIN:-3600})); [[ $kind == agentx ]] && lim=$((lim + $5))
   who=$(foreign | paste -sd';')
   [[ -n $who ]] && { log "RUN $tag skipped: gpus busy by foreign process: $who"; drop "$who"; grant; run "$spec"; return; }
   t0=$(date -u +%FT%TZ)
@@ -86,6 +89,10 @@ run() {
   for _ in $(seq 60); do  # learn the launcher job id so clean() can stop it if we are killed
     sleep 10; dir=$(ls -dt $R/pd-$tag-* 2>/dev/null | head -1)
     [[ -n $dir && -f $dir/run.txt ]] && { JOB=$(grep -o 'job=[0-9]*' "$dir/run.txt" | cut -d= -f2); break; }
+  done
+  while kill -0 $p 2>/dev/null; do
+    (( SECONDS > lim )) && { late=" watchdog-stopped"; log "RUN $tag past its limit (duration + ${WD_MARGIN:-3600} s): stopping it"; clean; kill $p 2>/dev/null; break; }
+    sleep 30
   done
   wait $p; t1=$(date -u +%FT%TZ)
   dir=$(ls -dt $R/pd-$tag-* 2>/dev/null | head -1); rc=$(cat "$dir/local-rc" 2>/dev/null | cut -d= -f2)
@@ -96,14 +103,15 @@ run() {
   else
     [[ $rc == 0 && -s $S/acc/mtp_$tag.json ]] && valid=yes || valid=no
   fi
+  [[ -n $late ]] && valid=no
   clean
-  if [[ $valid == no ]] && who=$(foreign | paste -sd';') && [[ -n $who ]]; then  # not our failure: someone took the GPUs
+  if [[ -z $late && $valid == no ]] && who=$(foreign | paste -sd';') && [[ -n $who ]]; then  # not our failure: someone took the GPUs
     [[ -n $dir ]] && mv "$dir" $S/harness/runs-aborted/
     log "RUN $tag skipped: gpus busy by foreign process: $who (rc=${rc:-?} start=$t0 end=$t1, dir moved to runs-aborted)"
     drop "$who"; grant; run "$spec"; return
   fi
   done_n=$((done_n + 1))
-  log "RUN $tag rc=${rc:-?} valid=$valid start=$t0 end=$t1 dir=${dir:-none}"
+  log "RUN $tag rc=${rc:-?}$late valid=$valid start=$t0 end=$t1 dir=${dir:-none}"
   [[ $valid == yes ]]
 }
 

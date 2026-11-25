@@ -4,7 +4,8 @@
 # acquire (-g 8 --wait) -> smoke B2-c150-r1 -> AgentX matrix (A/B1/B2 x c140/c150 x r1,r2, 1200 s) -> traced runs
 # -> GSM8K-200 (c32, 3 a arm; gsmB2r1 traced) -> A1 rerun (a1.sh, POINTS_EXTRA = B2's per-rank rows).
 # One line a run in $S/driver_status.txt. Stops on the first AgentX run without client data, or on YIELD;
-# always cleans its own containers and releases the lease (trap).
+# always cleans its own containers and releases the lease (trap). A node whose GPUs a foreign (unleased) process
+# uses is released with --force and skipped; the queue re-acquires elsewhere, at most MAXTRIES grants in all.
 set -uo pipefail
 S=/share_nfs/mengqing/code/tmp/m31-decode-dep4/35; D=$(dirname "$(readlink -f "$0")")
 G=/share_nfs/yajizhan/gpu-pool/bin/gpool; ST=$S/driver_status.txt; R=$S/harness/runs
@@ -28,24 +29,57 @@ finish() {
 }
 trap finish EXIT; trap 'why="driver killed"; exit 1' INT TERM HUP
 
-log "START acquiring a whole node"
-out=$($G acquire -g 8 -p "MengqingCao/ATOM#35 spike: M3.1 1P1D A/B1/B2 AgentX c140/c150 + GSM8K-200 + A1 rerun (~10h)" --wait --timeout 3h) \
-  || { why="acquire rc=$? (timed out or refused)"; exit 1; }
-echo "$out"
-LEASE=$(grep -o 'L[0-9a-f]\{6\}' <<<"$out" | head -1); HOST=$(grep -o 'pit2-p03-g[0-9]*' <<<"$out" | head -1); NODE=${HOST#pit2-p03-}
-[[ -n $LEASE && -n $NODE ]] || { why="cannot parse grant: $out"; exit 1; }
-log "GRANTED $LEASE $HOST"
-if ! ssh "$HOST" docker image inspect "$IMG" >/dev/null 2>&1; then
-  $G touch "$LEASE"; log "prep_image.sh $NODE"; bash "$D/prep_image.sh" "$NODE" || { why="prep_image failed"; exit 1; }
-fi
+# Foreign GPU users on $HOST, one line each ("container NAME (ID)" or "pid P uid U"); empty = clean.
+# Ours: mengqing-dep4-35-* containers, atomesh-*-<job>-<rank> containers of our launcher jobs, our uid on the host.
+foreign() {
+  local jobs; jobs=$(cat $R/*/run.txt $S/harness/runs-aborted/*/run.txt 2>/dev/null | grep -o 'job=[0-9]*' | cut -d= -f2 | paste -sd'|')
+  ssh "$HOST" 'for p in $(rocm-smi --showpids --json 2>/dev/null | grep -o "PID[0-9]*" | cut -c4-); do
+    c=$(grep -o "[0-9a-f]\{64\}" /proc/$p/cgroup 2>/dev/null | head -1)
+    if [ -n "$c" ]; then echo "container $(docker inspect -f "{{.Name}}" $c 2>/dev/null | tr -d /) (${c:0:12})"
+    else u=$(ps -o uid= -p $p | tr -d " "); [ -n "$u" ] && [ "$u" != "$(id -u)" ] && echo "pid $p uid $u"; fi
+  done' | sort -u | grep -vE "^container (mengqing-dep4-35-|atomesh-.*-(${jobs:-NONE})-[0-9]+)"
+}
+bad=; tries=0; MAXTRIES=4
+# Take a whole node (never one in $bad), get the image on it, and check no one else is on its GPUs.
+grant() {
+  local nodes out who
+  while :; do
+    tries=$((tries + 1)); ((tries > MAXTRIES)) && { why="no clean node after $MAXTRIES grants (busy: ${bad:-none})"; exit 1; }
+    nodes=$($G status --json | python3 -c "import json,sys;b='$bad'.split();print(','.join(n for n in json.load(sys.stdin)['free'] if n not in b))")
+    [[ -n $nodes ]] || { why="no pool node left outside ${bad}"; exit 1; }
+    log "START acquiring a whole node (attempt $tries, nodes $nodes)"
+    out=$($G acquire -g 8 --node "$nodes" -p "MengqingCao/ATOM#35 spike: M3.1 1P1D A/B1/B2 AgentX c140/c150 + GSM8K-200 + A1 rerun (~10h)" --wait --timeout 3h) \
+      || { why="acquire rc=$? (timed out or refused)"; exit 1; }
+    echo "$out"
+    LEASE=$(grep -o 'L[0-9a-f]\{6\}' <<<"$out" | head -1); HOST=$(grep -o 'pit2-p03-g[0-9]*' <<<"$out" | head -1); NODE=${HOST#pit2-p03-}
+    [[ -n $LEASE && -n $NODE ]] || { why="cannot parse grant: $out"; exit 1; }
+    log "GRANTED $LEASE $HOST"
+    if ! ssh "$HOST" docker image inspect "$IMG" >/dev/null 2>&1; then
+      $G touch "$LEASE"; log "prep_image.sh $NODE"; bash "$D/prep_image.sh" "$NODE" || { why="prep_image failed"; exit 1; }
+    fi
+    who=$(foreign | paste -sd';'); [[ -z $who ]] && return 0
+    drop "$who"
+  done
+}
+# Our lease's GPUs are used by someone else: hand the node back (--force: that memory is provably not ours) and skip it.
+drop() {
+  log "BUSY $NODE $LEASE: gpus busy by foreign process: $1"
+  clean
+  $G release "$LEASE" --force --note "#35 driver: GPUs busy with a foreign unleased process ($1), nothing of ours ran; re-queuing elsewhere"
+  log "END released $LEASE on $NODE: foreign process"; bad="$bad $NODE"; LEASE=
+}
+grant
 
 yield() { $G mine | grep "$LEASE" | grep -q YIELD; }
 
 # run SPEC: one batch.sh spec; sets rc, dir; writes the status line. Returns 1 if the run is invalid.
+# A run whose GPUs are (or became) used by a foreign process is skipped, its dir moved to runs-aborted/, and redone on another node.
 run() {
-  local spec=$1 t0 t1 tag kind valid
+  local spec=$1 t0 t1 tag kind valid who
   yield && { why="lease YIELD before '$spec'"; exit 0; }
   set -- ${spec#TRACE=1:}; tag=$1 kind=$3
+  who=$(foreign | paste -sd';')
+  [[ -n $who ]] && { log "RUN $tag skipped: gpus busy by foreign process: $who"; drop "$who"; grant; run "$spec"; return; }
   t0=$(date -u +%FT%TZ)
   ssh "$HOST" "bash $D/batch.sh '$spec'" &
   local p=$!
@@ -62,7 +96,13 @@ run() {
   else
     [[ $rc == 0 && -s $S/acc/mtp_$tag.json ]] && valid=yes || valid=no
   fi
-  clean; done_n=$((done_n + 1))
+  clean
+  if [[ $valid == no ]] && who=$(foreign | paste -sd';') && [[ -n $who ]]; then  # not our failure: someone took the GPUs
+    [[ -n $dir ]] && mv "$dir" $S/harness/runs-aborted/
+    log "RUN $tag skipped: gpus busy by foreign process: $who (rc=${rc:-?} start=$t0 end=$t1, dir moved to runs-aborted)"
+    drop "$who"; grant; run "$spec"; return
+  fi
+  done_n=$((done_n + 1))
   log "RUN $tag rc=${rc:-?} valid=$valid start=$t0 end=$t1 dir=${dir:-none}"
   [[ $valid == yes ]]
 }

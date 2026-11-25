@@ -98,6 +98,7 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._pending_recv_stall_watch = {}
     c._held_failures = {}
     c._pending_recv_failed = set()
+    c._pending_recv_wrote = set()
     c.done_sending = set()
     c.done_recving = set()
     c.failed_recving = set()
@@ -288,6 +289,7 @@ def consumer(expected=2):
     c._pending_recv_stall_watch = {}
     c._held_failures = {}
     c._pending_recv_failed = set()
+    c._pending_recv_wrote = set()
     c._fence_lock = threading.Lock()
     c._pending_recv_expected = {21: expected}
     c._pending_recv_stages = {}
@@ -357,6 +359,81 @@ def test_chunked_failure_preserves_main_receive_hold(monkeypatch):
     c._report_held_failures()
     assert c.failed_recving == {21}
     assert not c._pending_recv_blocks and not c._received_handoffs
+
+
+def listen(connector, messages, monkeypatch):
+    """Run the real notification listener over ``messages``, then stop it."""
+    from contextlib import nullcontext
+
+    class Drained(Exception):
+        pass
+
+    class Socket:
+        def getsockopt(self, _option):
+            return b"tcp://cpu:2"
+
+        def recv_multipart(self):
+            if not messages:
+                raise Drained
+            return [b"producer", *messages.pop(0)]
+
+    connector._listener_bound = threading.Event()
+    connector._listener_error = None
+    monkeypatch.setattr(mc, "zmq_socket_ctx", lambda *a, **kw: nullcontext(Socket()))
+    with pytest.raises(Drained):
+        connector._notification_listener()
+
+
+@pytest.mark.parametrize("wire", ["current", "without_wrote"])
+@pytest.mark.parametrize("landing", [False, True])
+def test_retired_unwritten_pp_receive_fails_without_hold(monkeypatch, landing, wire):
+    import msgpack
+
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    d = consumer(4)
+    if landing:
+        from test_pd_mla_landing import _Dest
+
+        dest = _Dest()
+        dest.recv._finish = d._complete_recv
+        dest.recv.begin(21, 3, [2, 9, 4], {pp: f"stage{pp}" for pp in range(4)})
+        d._landing = dest.recv
+        # The receiver tracks a landing request, not the write-done tables.
+        d._pending_recv_expected.clear()
+        d._pending_handoffs = {21: mc._PendingHandoff(landing_nonce=3, expected=4)}
+    sent = []
+    for pp in range(4):
+        p, request, _, _ = idle_producer(pp, 4)
+        del p._notify_transfer_result  # the real one
+        p._kv_staging = None
+        p._send_on_socket = lambda _path, parts, repeat=1: sent.append(parts)
+        abort = ConnectorMetadata()
+        abort.add_new_req_to_save(
+            7,
+            [5, 1, 8],
+            {
+                "transfer_id": "xfer-a",
+                "chunked_transfer": True,
+                "num_prompt_tokens": 10,
+                "prefill_aborted": True,
+            },
+        )
+        p.start_load_kv(abort)  # P retires the transfer before writing any of it
+        dispatch(p, request)
+        assert p.transfer_engine.writes.empty()
+    assert len(sent) == 4
+    if wire == "without_wrote":  # a producer that predates the field
+        for parts in sent:
+            data = msgpack.loads(parts[1])
+            del data["wrote"]
+            parts[1] = msgpack.dumps(data)
+    listen(d, sent[:3], monkeypatch)
+    assert not d.failed_recving and not d._held_failures
+    listen(d, sent[3:], monkeypatch)
+    if wire == "without_wrote":
+        assert set(d._held_failures) == {21} and not d.failed_recving
+    else:
+        assert d.failed_recving == {21} and not d._held_failures
 
 
 def test_source_release_requires_every_tp_rank_of_every_pp_stage():
@@ -1042,7 +1119,9 @@ def test_idle_write_listener_expires_unadmitted_chunk_request(monkeypatch):
         p._send_executor = pool
         with pytest.raises(StopListener):
             p._write_listener()
-    p._notify_transfer_result.assert_called_once_with(request, success=False)
+    p._notify_transfer_result.assert_called_once_with(
+        request, success=False, wrote=False
+    )
     assert request["transfer_id"] in p._retired_chunked_transfers
     assert not p._pending_chunked_requests
 
@@ -1237,7 +1316,9 @@ def test_late_metadata_cannot_resurrect_retired_source():
     worker.start_load_kv(meta)
     assert not worker._chunked_prefills and worker.get_finished().is_empty()
     dispatch(worker, wire)
-    worker._notify_transfer_result.assert_called_once_with(wire, success=False)
+    worker._notify_transfer_result.assert_called_once_with(
+        wire, success=False, wrote=False
+    )
     assert worker.transfer_engine.writes.empty()
 
 
@@ -2053,9 +2134,14 @@ def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
     registration = p.kv_connector.build_connector_meta()
     for rank, worker in enumerate(workers):
         worker.start_load_kv(registration)
-        worker._notify_transfer_result.side_effect = lambda data, success, rank=rank: (
-            dw._record_write_done(
-                data["request_id"], rank, 0, data["write_nonce"], success=success
+        worker._notify_transfer_result.side_effect = (
+            lambda data, success, wrote=True, rank=rank: dw._record_write_done(
+                data["request_id"],
+                rank,
+                0,
+                data["write_nonce"],
+                success=success,
+                wrote=wrote,
             )
         )
     dw._send_on_socket.side_effect = lambda _addr, message: [
@@ -2090,15 +2176,9 @@ def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
         worker.get_finished()
         assert worker.transfer_engine.writes.empty()
         d._update_from_kv_xfer_finished(dw.get_finished())
-        assert ds.block_table and d.block_manager.kv.num_free == 0
-    now[0] = 139.0
-    d._update_from_kv_xfer_finished(dw.get_finished())
-    assert ds.block_table and d.block_manager.kv.num_free == 0
-    if admission:
-        assert d.pd_admission.pending_bytes == 12
-        assert d.pd_admission.pending[str(ds.id)].cancelled is cancel_decode
-    now[0] = 140.0
-    d._update_from_kv_xfer_finished(dw.get_finished())
+        if rank < pp_size - 1:
+            assert ds.block_table and d.block_manager.kv.num_free == 0
+    # No stage wrote, so D frees the pages without the failed-write hold.
     assert not ds.block_table and d.block_manager.kv.num_free == 3
     if admission:
         assert not d.pd_admission.pending

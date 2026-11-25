@@ -318,7 +318,13 @@ steps where the code it replaces, B1, runs MXFP4:
 - At the A1 points the group runs 400-600 rows, so MegaMoE serves them; the
   fallback serves steps whose busiest rank holds fewer than 8 decoding
   requests (4 x 8 x 8 = 256 padded rows). A, padding its true total, runs
-  MXFP4 only from 29 requests in the group (bucket 32).
+  MXFP4 only from 29 requests in the group (bucket 32) under the arms' decode
+  capture ladder (`1..8, 10, 12, 14, 16, 20, 24, 28, 32, ...`, the 1P1D
+  launch scripts' `--cudagraph-capture-sizes`); under the repo default
+  (`EngineArgs.cudagraph_capture_sizes`, `1..8, 16, 32, ...`) it runs MXFP4
+  from 17. The 8-per-rank bound holds under both ladders. All these
+  thresholds assume FULL graph mode, where a decode bucket pads to bucket x 8
+  rows.
 - Cost: no second weight copy. On gfx950 MegaMoE's weights are fused_moe's
   gate-up-interleave layout: `flydsl_mega_experts.py: build_mega_weights`
   calls aiter `shuffle_weight_a16w4` / `shuffle_scale_a16w4`, which are

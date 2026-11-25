@@ -427,6 +427,11 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only --a
 
 Clients send `Authorization: Bearer <key>`. Workers declared on the CLI inherit the router key.
 
+## Design documents
+
+- [Principles](docs/principles.md): the project's layer on top of agent-team's default principles.
+- [Load signals for native vLLM workers](docs/vllm_load.md): how the LoadMonitor reads vLLM load for `power_of_two`, and how decode `least_load` is proven on vLLM P/D.
+
 ## Acknowledgments
 
 Atomesh was derived from [sgl-model-gateway](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway) and has since been substantially reworked into an independent serving layer for the **ATOM** stack and **AMD** hardware. Its routing, scheduling, runtime integration, and performance-sensitive paths are designed around AMD accelerator deployments and ATOM-specific serving requirements.

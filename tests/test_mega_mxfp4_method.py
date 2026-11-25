@@ -301,6 +301,9 @@ class _PrepareFinalize:
     def supports_async(self):
         return False
 
+    def needs_dispatch_output_trim(self):
+        return True
+
     def prepare(self, hidden, weights, ids, *_args, x_scale=None):
         return hidden, None, SimpleNamespace(expert_num_tokens="counts"), None, None
 
@@ -485,7 +488,7 @@ def test_the_fallback_runs_bf16_at_every_row_count_it_serves(monkeypatch):
     from atom.model_ops.fused_moe.flydsl_mega_experts import build_mega_weights
 
     monkeypatch.setattr(fused_moe, "get_gfx_runtime", lambda: "gfx950")
-    experts, inter, hidden = 2, 32, 256
+    experts, inter, hidden = 2, 128, 256
     layer = SimpleNamespace(
         w13_weight=torch.zeros(experts, 2 * inter, hidden // 2, dtype=torch.uint8).view(
             dtypes.fp4x2

@@ -381,13 +381,20 @@ def test_instances_route_with_a_bf16_combine_wire(runtime):
 
 
 def test_cache_key_separates_activations_and_limits(runtime):
-    for act, limit in [("silu", 7.0), ("swigluoai", 7.0), ("swigluoai", 10.0)] * 2:
+    pairs = [("silu", 7.0), ("swigluoai", 7.0), ("swigluoai", 10.0)]
+    for act, limit in pairs * 2:
         runtime.run(_context(64), world=4, experts=128, act=act, swiglu_limit=limit)
 
-    assert sorted(
-        (i.kwargs["act"], i.kwargs["swiglu_limit"]) for i in runtime.instances.values()
-    ) == [("silu", 7.0), ("swigluoai", 7.0), ("swigluoai", 10.0)]
+    # One instance per (act, limit), each built once and reused after.
     assert len(_built(runtime)) == 3
+    assert len(mega._MEGA_CACHE) == 3
+    assert (
+        sorted(
+            (m.kwargs["act"], m.kwargs["swiglu_limit"])
+            for m in mega._MEGA_CACHE.values()
+        )
+        == pairs
+    )
 
 
 @pytest.mark.parametrize(

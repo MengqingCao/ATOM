@@ -4,6 +4,7 @@
 import ctypes
 import queue
 import threading
+import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -384,6 +385,20 @@ def listen(connector, messages, monkeypatch):
         connector._notification_listener()
 
 
+def land(connector):
+    """Track request 21 of four stages in a real landing receiver."""
+    from test_pd_mla_landing import _Dest
+
+    dest = _Dest()
+    dest.recv._finish = connector._complete_recv
+    dest.recv.begin(21, 3, [2, 9, 4], {pp: f"stage{pp}" for pp in range(4)})
+    connector._landing = dest.recv
+    # The receiver tracks a landing request, not the write-done tables.
+    connector._pending_recv_expected.clear()
+    connector._pending_handoffs = {21: mc._PendingHandoff(landing_nonce=3, expected=4)}
+    return dest.recv
+
+
 @pytest.mark.parametrize("wire", ["current", "without_wrote"])
 @pytest.mark.parametrize("landing", [False, True])
 def test_retired_unwritten_pp_receive_fails_without_hold(monkeypatch, landing, wire):
@@ -392,15 +407,7 @@ def test_retired_unwritten_pp_receive_fails_without_hold(monkeypatch, landing, w
     monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     d = consumer(4)
     if landing:
-        from test_pd_mla_landing import _Dest
-
-        dest = _Dest()
-        dest.recv._finish = d._complete_recv
-        dest.recv.begin(21, 3, [2, 9, 4], {pp: f"stage{pp}" for pp in range(4)})
-        d._landing = dest.recv
-        # The receiver tracks a landing request, not the write-done tables.
-        d._pending_recv_expected.clear()
-        d._pending_handoffs = {21: mc._PendingHandoff(landing_nonce=3, expected=4)}
+        land(d)
     sent = []
     for pp in range(4):
         p, request, _, _ = idle_producer(pp, 4)
@@ -434,6 +441,31 @@ def test_retired_unwritten_pp_receive_fails_without_hold(monkeypatch, landing, w
         assert set(d._held_failures) == {21} and not d.failed_recving
     else:
         assert d.failed_recving == {21} and not d._held_failures
+
+
+@pytest.mark.parametrize("landing", [False, True])
+def test_a_stage_that_wrote_keeps_the_failed_write_hold(monkeypatch, landing):
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    d = consumer(4)
+    if landing:
+        land(d)
+    # Stage 0 failed mid-write; the later stages never started.
+    for pp in range(4):
+        d._record_write_done(21, pp, 0, 3, success=False, wrote=pp == 0)
+    assert set(d._held_failures) == {21} and not d.failed_recving
+
+
+def test_an_expired_landing_receive_keeps_the_failed_write_hold(monkeypatch):
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    d = consumer(4)
+    recv = land(d)
+    # Stage 0 acknowledged and went silent past its window; it may be writing.
+    assert recv.stage_acked(21, 0, 3, time.monotonic() - 1)
+    for pp in range(1, 4):
+        assert not d._record_write_done(21, pp, 0, 3, success=False, wrote=False)
+    assert not d._held_failures and not d.failed_recving
+    recv.sweep()
+    assert set(d._held_failures) == {21} and not d.failed_recving
 
 
 def test_source_release_requires_every_tp_rank_of_every_pp_stage():

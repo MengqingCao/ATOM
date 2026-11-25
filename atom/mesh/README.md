@@ -261,7 +261,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 | `random` | Uniform random selection |
 | `round_robin` | Sequential rotation with atomic counters |
 | `cache_aware` | Prefix-tree matching for cache reuse, with configurable balance thresholds; with `--kv-events`, a request the router can tokenize goes by the blocks each worker's device cache holds, once one holds more of it than `cache_threshold`. Requests with media, imbalanced load and workers without indexed events stay on the tree |
-| `power_of_two` | Chooses the lighter of two randomly sampled workers |
+| `power_of_two` | Chooses the lighter of two randomly sampled workers, by the load the monitor samples from each worker: `num_tokens` from `/get_load` for SGLang, `/metrics` requests for ATOM, and `/metrics` requests with the KV cache usage as a tie-break for vLLM, per `url@rank`. A worker whose read fails falls back, with its pair, to the router's in-flight request counts |
 | `prefix_hash` | Consistent prefix hashing |
 | `agentic` | Prefill and regular pools. Lowest prefill cost: queued prefill tokens, plus the prompt tokens the worker's GPU cache does not hold (from `--kv-events`, or a text tree for requests the index cannot match), plus `--agentic-request-token-equivalent` (512) per in-flight request. See [agentic routing](docs/agentic_cost.md) |
 | `least_load` | PD decode only. Lowest outstanding cost at `url@rank`: prompt tokens reserved from selection until the decode response ends, plus `--agentic-request-token-equivalent` (512, shared with `agentic`) per in-flight request. A request with no token count counts as one request and makes the choice compare in-flight counts |

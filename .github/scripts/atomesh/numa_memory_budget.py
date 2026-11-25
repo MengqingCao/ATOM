@@ -210,12 +210,19 @@ def main(argv: list[str] | None = None) -> int:
     planned = plan_pins(args.pins, args.gpus, args.per_gpu_gib, args.sysfs)
     status = check_budget(planned, args.reserve_gib, args.sysfs)
     if status == 0 and args.compact:
-        compact_nodes(planned, args.compact_timeout)
+        compact_nodes(planned, args.compact_timeout, args.reserve_gib)
     return status
 
 
-def compact_nodes(planned: dict[int, float], timeout: float = 600.0) -> None:
+def compact_nodes(
+    planned: dict[int, float], timeout: float = 600.0, reserve_gib: float = 0.0
+) -> None:
     """Compact each node for its pins: compact_huge_pages.py bound to the node.
+
+    Each node is compacted for its pins plus min(reserve, pins / 16): a node
+    whose page cache must be reclaimed gives a few GiB as 4 KiB pages
+    (pit2-p03-g48: 1017 of 1024 GiB huge), which the last owner to fault then
+    takes and its ionic NIC refuses to register.
 
     One node at a time, each stopped after ``timeout`` seconds; a failure or a
     timeout only warns, since the pins' owners check their own pages.
@@ -224,8 +231,9 @@ def compact_nodes(planned: dict[int, float], timeout: float = 600.0) -> None:
     for node in sorted(planned):
         if planned[node] <= 0:
             continue
+        gib = planned[node] + min(reserve_gib, planned[node] / 16)
         print(
-            f"[numa-budget] compacting NUMA node {node} for {planned[node]:.0f} GiB",
+            f"[numa-budget] compacting NUMA node {node} for {gib:.0f} GiB",
             flush=True,
         )
         try:
@@ -237,7 +245,7 @@ def compact_nodes(planned: dict[int, float], timeout: float = 600.0) -> None:
                     str(node),
                     sys.executable,
                     str(here / "compact_huge_pages.py"),
-                    f"{planned[node]:g}",
+                    f"{gib:g}",
                 ],
                 check=False,
                 timeout=timeout,

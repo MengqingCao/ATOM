@@ -180,6 +180,12 @@ class NumaMemoryBudgetTest(unittest.TestCase):
         )
         self.assertEqual(self.timeouts, [600.0, 600.0])
 
+    def test_compact_adds_a_margin_of_the_reserve_up_to_a_sixteenth(self):
+        _, calls = self.compact("--reserve-gib", "128", "0:1024", "1:960")
+        self.assertEqual([cmd[-1] for cmd in calls], ["1088", "1020"])
+        _, calls = self.compact("--reserve-gib", "8", "0:1024")
+        self.assertEqual([cmd[-1] for cmd in calls], ["1032"])
+
     def test_a_compaction_that_overruns_is_stopped_and_only_warns(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):

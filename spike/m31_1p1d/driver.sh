@@ -49,7 +49,7 @@ grant() {
     nodes=$($G status --json | python3 -c "import json,sys;b='$bad'.split();print(','.join(n for n in json.load(sys.stdin)['free'] if n not in b))")
     [[ -n $nodes ]] || { why="no pool node left outside ${bad}"; exit 1; }
     log "START acquiring a whole node (attempt $tries, nodes $nodes)"
-    out=$($G acquire -g 8 --node "$nodes" -p "MengqingCao/ATOM#35 spike: M3.1 1P1D A/B1/B2 AgentX c140/c150 + GSM8K-200 + A1 rerun (~10h)" --wait --timeout 3h) \
+    out=$($G acquire -g 8 --node "$nodes" -p "MengqingCao/ATOM#35 spike: M3.1 1P1D A/B1/B2 AgentX c140/c150 + GSM8K-200 + A1 rerun, prefill 2 TiB Mooncake CPU KV tier (~10h)" --wait --timeout 3h) \
       || { why="acquire rc=$? (timed out or refused)"; exit 1; }
     echo "$out"
     LEASE=$(grep -o 'L[0-9a-f]\{6\}' <<<"$out" | head -1); HOST=$(grep -o 'pit2-p03-g[0-9]*' <<<"$out" | head -1); NODE=${HOST#pit2-p03-}
@@ -58,6 +58,10 @@ grant() {
     if ! ssh "$HOST" docker image inspect "$IMG" >/dev/null 2>&1; then
       $G touch "$LEASE"; log "prep_image.sh $NODE"; bash "$D/prep_image.sh" "$NODE" || { why="prep_image failed"; exit 1; }
     fi
+    # The prefill's 2 TiB Store pins 1024 GiB a NUMA node (+128 GiB launcher reserve): MemFree + page cache must hold it.
+    mem=$(ssh "$HOST" 'for n in 0 1; do awk "/MemFree|FilePages/{s+=\$4} END{print int(s/1048576)}" /sys/devices/system/node/node$n/meminfo; done' | paste -sd' ')
+    log "MEM $NODE free+cache GiB per NUMA node: ${mem:-?} (Store needs 1152 each)"
+    for m in ${mem:-0}; do ((m >= 1152)) || { drop "host memory short for the 2 TiB Store (free+cache GiB per NUMA: $mem)"; continue 2; }; done
     who=$(foreign | paste -sd';'); [[ -z $who ]] && return 0
     drop "$who"
   done
@@ -69,7 +73,7 @@ drop() {
   $G release "$LEASE" --force --note "#35 driver: GPUs busy with a foreign unleased process ($1), nothing of ours ran; re-queuing elsewhere"
   log "END released $LEASE on $NODE: foreign process"; bad="$bad $NODE"; LEASE=
 }
-log "CONFIG #35 ruling, all arms: decode DP session affinity off (no dp_sticky/--dp-aware/X-Session-ID; router policy random), AgentX warmup_requests_per_lane=1 (was 10), window 1200 s, warmup_grace_period 1800 s; watchdog agentx duration+${WD_MARGIN:-1800} s, gsm8k 3600 s"
+log "CONFIG #35 ruling 7167528921, all arms: prefill KV CPU tier = Mooncake Store 2 TiB host DRAM (MOONCAKE_STORE=1, owners 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7; ATOM_KV_OFFLOAD=mooncake_store via launcher; decode no tier); ruling 7164687062: decode DP session affinity off (no dp_sticky/--dp-aware/X-Session-ID; router policy random), AgentX warmup_requests_per_lane=1 (was 10), window 1200 s, warmup_grace_period 1800 s; watchdog agentx duration+${WD_MARGIN:-1800} s, gsm8k 3600 s"
 grant
 
 yield() { $G mine | grep "$LEASE" | grep -q YIELD; }
@@ -117,6 +121,11 @@ run() {
 }
 
 run 'B2-c150-r1 B2 agentx 150 1200' || { why="smoke B2-c150-r1 invalid: diagnose"; exit 1; }
+# The smoke must show the CPU tier in use and a higher prefix hit than the no-tier smoke (41.46 %, pd-B2-c150-r1-20261125141241).
+hit=$(python3 -c "import json;p=json.load(open('$dir/report.json'))['prefill'];print(p.get('offload_hit_pct'),p.get('total_hit_pct'))" 2>/dev/null)
+log "SMOKE prefill hit: offload(CPU tier) total = ${hit:-none} %"
+python3 -c "import sys;o,t=map(float,'$hit'.split());sys.exit(not (o > 0 and t > 41.46))" 2>/dev/null \
+  || { why="smoke B2-c150-r1: CPU tier not in use or prefix hit not above 41.46 % ($hit): diagnose"; exit 1; }
 for r in 1 2; do for c in 140 150; do for a in A B1 B2; do
   [[ $a$c$r == B21501 ]] && continue
   run "$a-c$c-r$r $a agentx $c 1200" || { why="$a-c$c-r$r invalid: diagnose"; exit 1; }

@@ -32,3 +32,32 @@
  }
  
  
+--- a/bin/pd_scrape.py
++++ b/bin/pd_scrape.py
+@@ -38,6 +38,7 @@
+     "atom:prefill_batch_tokens_count",
+     "atom:prefix_cache_cached_tokens_total",
+     "atom:prefix_cache_full_tokens_total",
++    "atom:prefix_cache_offload_tokens_total",
+     "atom:request_queue_time_seconds_sum",
+     "atom:request_queue_time_seconds_count",
+     "atom:time_to_first_token_seconds_sum",
+--- a/bin/pd_report.py
++++ b/bin/pd_report.py
+@@ -251,6 +251,7 @@
+ 
+     tok, fw = d("atom:prefill_batch_tokens_sum"), d("atom:prefill_batch_tokens_count")
+     cached, full = d("atom:prefix_cache_cached_tokens_total"), d("atom:prefix_cache_full_tokens_total")
++    off = d("atom:prefix_cache_offload_tokens_total")  # Mooncake Store (CPU tier) hits beyond HBM
+     qs, qc = d("atom:request_queue_time_seconds_sum"), d("atom:request_queue_time_seconds_count")
+     fs = d("atom:gpu_forward_seconds_sum")
+     busy = {}
+@@ -266,6 +267,8 @@
+         "forwards_s": r(n_fw / dt_s),
+         "tokens_per_forward": round(sum(tok.values()) / n_fw) if n_fw else None,
+         "prefix_hit_pct": r(100 * sum(cached.values()) / sum(full.values())) if sum(full.values()) else None,
++        "offload_hit_pct": r(100 * sum(off.values()) / sum(full.values())) if sum(full.values()) else None,
++        "total_hit_pct": r(100 * (sum(cached.values()) + sum(off.values())) / sum(full.values())) if sum(full.values()) else None,
+         "queue_time_mean_s": r(sum(qs.values()) / sum(qc.values()), 2) if sum(qc.values()) else None,
+         "stage_gpu_forward_busy": {k: r(v, 3) for k, v in sorted(busy.items())},
+         "waiting_p50": pct(waiting, 50), "waiting_p90": pct(waiting, 90),

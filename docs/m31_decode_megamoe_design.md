@@ -256,7 +256,8 @@ leaves `indexer_cp_unsupported_reason` alone, so none of these gaps is a sync.
   expand each row's page table to one row per KV head (page16 * H + h), as the
   target's fused top-k already emits for `sparse_pa_per_row`. A CPU-tested
   patch exists in the prior material
-  (`dep-code/patches/m31_dspark_tp1_draft.patch`); T2 rebuilds it on the
+  (`dep-code/worktree_changes_at_stop.patch`, its `config.py`, `dspark.py`
+  and test hunks); T2 rebuilds it on the
   integration branch and checks draft parity on a GPU.
 - `ATOM_M3_INDEXER_CP=1` with `--enable-dp-attention` passes
   `atom/config.py: indexer_cp_unsupported_reason` and crashes in the first

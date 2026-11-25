@@ -38,7 +38,10 @@ if ((${#TESTS[@]})); then
     echo "== pytest ${TESTS[*]}"
     # Needs aiter, which the CPU venv lacks; GPU runs cover it.
     TMPDIR=$SCR PYTHONPATH=. "$PY" -m pytest -q -p no:cacheprovider --basetemp="$SCR/bt" \
-        --deselect tests/test_dspark_draft.py::test_a_draft_ignores_the_targets_quantization "${TESTS[@]}" || fail=1
+        --deselect tests/test_dspark_draft.py::test_a_draft_ignores_the_targets_quantization "${TESTS[@]}"
+    rc=$?
+    # 5: every reached file skips whole without aiter, which is the same as no tests reached.
+    ((rc == 0 || rc == 5)) || fail=1
     rm -rf "$SCR"
 else
     echo "== no tests reached"

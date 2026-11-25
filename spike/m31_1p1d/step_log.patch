@@ -1,15 +1,15 @@
-From fff1ef280bacfeaef1e6edd2b54033371f5bd5b8 Mon Sep 17 00:00:00 2001
+From c1af8791d98a1fa8c3fb8ca9fea46536b7dd0aee Mon Sep 17 00:00:00 2001
 From: spike <spike@local>
 Date: Wed, 25 Nov 2026 07:53:45 +0000
 Subject: [PATCH] spike #35: ATOM_SPIKE_STEP_LOG per-step DP rows recorder
  (local only)
 
 ---
- atom/utils/forward_context.py | 12 ++++++++++++
- 1 file changed, 12 insertions(+)
+ atom/utils/forward_context.py | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
 
 diff --git a/atom/utils/forward_context.py b/atom/utils/forward_context.py
-index 6ae5d568c..c6c1e5847 100644
+index 6ae5d568c..495ed7fcb 100644
 --- a/atom/utils/forward_context.py
 +++ b/atom/utils/forward_context.py
 @@ -2,6 +2,7 @@
@@ -20,28 +20,43 @@ index 6ae5d568c..c6c1e5847 100644
  import threading
  from collections.abc import Container
  from contextlib import contextmanager
-@@ -19,6 +20,12 @@ from atom.utils import region_graph
+@@ -19,6 +20,24 @@ from atom.utils import region_graph
  from atom.utils.tbo.ubatch_splitting import UBatchSlice, decode_bucket_splits
  from atom.utils.tbo.ubatching import sync_dp_metadata
  
-+_STEP_LOG = (
-+    open("%s.%d" % (os.environ["ATOM_SPIKE_STEP_LOG"], os.getpid()), "w", buffering=1 << 16)
-+    if os.environ.get("ATOM_SPIKE_STEP_LOG")
-+    else None
-+)
++
++def _open_step_log():
++    """spike #35 recorder; never fails the server: no file -> recorder off."""
++    path = os.environ.get("ATOM_SPIKE_STEP_LOG")
++    if not path:
++        return None
++    # A relative path lands in the atomesh container's RUN_DIR (host: <run>/slurm_job-*/).
++    path = os.path.join(os.environ.get("RUN_DIR", "."), path)
++    try:
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        return open("%s.%d" % (path, os.getpid()), "w", buffering=1 << 16)
++    except OSError as e:
++        logging.getLogger(__name__).warning("ATOM_SPIKE_STEP_LOG off: %s", e)
++        return None
++
++
++_STEP_LOG = _open_step_log()
 +
  if TYPE_CHECKING:
      from atom.distributed.pcp_utils import PcpBalGroup
      from atom.model_ops.dcp_ops import DcpSparsePrefillKV
-@@ -367,6 +374,11 @@ class ForwardMode:
+@@ -367,6 +386,14 @@ class ForwardMode:
          if unified:
              # Every rank runs the group's height.
              running_tokens_per_dp_rank.fill(running_tokens)
 +        if _STEP_LOG is not None and dp_size > 1:
 +            # spike #35: one line per step, every rank's scheduled tokens and the padded rows.
-+            _STEP_LOG.write("%s %d %d %d\n" % (
-+                ",".join(map(str, sync.scheduled_tokens_per_dp_rank.tolist())),
-+                int(sync.any_rank_has_prefill), running_bs, running_tokens))
++            try:
++                _STEP_LOG.write("%s %d %d %d\n" % (
++                    ",".join(map(str, sync.scheduled_tokens_per_dp_rank.tolist())),
++                    int(sync.any_rank_has_prefill), running_bs, running_tokens))
++            except OSError:
++                pass  # recorder must never fail a step
          return cls(
              use_cudagraph=use_cudagraph,
              is_prefill=is_prefill,

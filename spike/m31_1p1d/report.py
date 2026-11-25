@@ -4,7 +4,7 @@
 Usage: report.py RUN_DIR... (runs named pd-<ARM>-c<C>-r<k>-<stamp>, each with report.json from pd_report.py)
 Per arm and point: mean of the runs and their spread (max-min as % of the mean) for output tok/s per GPU
 (8 GPUs), TPOT p50/p90, TTFT p50/p90, decode running batch mean, and each run's limit verdict.
-DP arms: steps/dp.<pid> (run tree's ATOM_SPIKE_STEP_LOG, one line per step: every rank's scheduled tokens,
+DP arms: slurm_job-*/steps/dp.<pid> (run tree's ATOM_SPIKE_STEP_LOG, one line per step: every rank's scheduled tokens,
 any-prefill, padded running_bs, running_tokens). On all-decode steps (8 verify rows a request) a step is
 "uneven" when the padded group rows (4 x running_tokens) reach 256, the MXFP4 threshold MegaMoE runs at,
 while the true group rows (sum of scheduled tokens) stay below it.
@@ -23,7 +23,7 @@ KEYS = [("out_tok_s_per_gpu", "client"), ("tpot_p50_ms", "client"), ("tpot_p90_m
 
 
 def steps(run):
-    files = sorted(glob.glob(os.path.join(run, "steps", "dp.*")), key=os.path.getsize)
+    files = sorted(glob.glob(os.path.join(run, "slurm_job-*", "steps", "dp.*")), key=os.path.getsize)
     if not files:
         return None
     dec = []

@@ -299,12 +299,16 @@ steps where the code it replaces, B1, runs MXFP4:
   to it), so the choice is the same on every rank, matches B1 on every step,
   and is as static under graph capture as B1's own dtype choice.
 - It is not the count A sees. A pads the group's true total, one bucket for all
-  its requests; B2 pads per rank. On an even step the two agree; on an uneven
-  one they part: per-rank requests (8, 1, 1, 1) are 256 padded rows, so B2
-  runs MegaMoE (MXFP8) and B1 runs MXFP4, while A at 11 requests runs bf16.
-  On such steps B2 is below A and never below B1. The true total cannot drive
-  the choice, because a decode graph records one branch per bucket; recording
-  each bucket twice would double the decode graphs. The owner ruled for the
+  its requests; B2 pads per rank. Under the arms' decode capture ladder
+  (below) an even step gives both one dtype, and wherever A runs MXFP4 B2
+  runs MegaMoE. Under the repo default ladder they also part where A runs
+  MXFP4 and no rank reaches 8 requests: at 5 to 7 per rank A pads 20 to 28
+  up to 32 (256 rows, MXFP4) while B2's 160 to 224 rows run bf16, above A.
+  Under either ladder an uneven step can put B2 below A: per-rank requests
+  (8, 1, 1, 1) are 256 padded rows, so B2 runs MegaMoE (MXFP8) and B1 runs
+  MXFP4, while A at 11 requests runs bf16. B2 is never below B1. The true
+  total cannot drive the choice, because a decode graph records one branch
+  per bucket; recording each bucket twice would double the decode graphs. The owner ruled for the
   padded count on #53 (https://github.com/MengqingCao/ATOM/pull/53#issuecomment-7154894181);
   T3 reports the share of uneven steps.
 - MegaMoE runs when A's `activation_dtype` for that count is MXFP4, computed

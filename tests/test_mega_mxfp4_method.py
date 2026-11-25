@@ -418,7 +418,8 @@ def test_mega_builds_the_mori_kernel_next_to_its_own(mega_method):
     assert isinstance(
         method.mori_experts, mega_method.modular_kernel.FusedMoEModularKernel
     )
-    # MoRI carries bf16 rows, as on B1 and as Mega's own dispatch takes them.
+    # MoRI carries bf16 rows, as the standard EP path carries them and as
+    # Mega's own dispatch takes them.
     assert mega_method.wire is None
     assert method.routed_rows_wire is None
 

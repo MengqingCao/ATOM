@@ -2856,14 +2856,15 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         logger.info("Prepared MegaMoE weights for fused MoE layer")
 
     def init_prepare_finalize(self, layer: torch.nn.Module):
-        # Mega includes dispatch, both GEMMs, and combine, so it must not
-        # allocate the standard MORI prepare/finalize modular kernel. Instead it
-        # installs itself as the whole-pipeline `fused_experts` backend, so the
-        # post-routing tail of the inherited `apply` dispatches to it exactly the
-        # way it dispatches to the MORI modular kernel.
+        # Mega includes dispatch, both GEMMs, and combine. The MoRI
+        # prepare/finalize modular kernel the parent builds serves the steps
+        # Mega does not take (`apply`), over the same weights, with bf16 rows on
+        # its wire as Mega's dispatch takes them.
         from atom.model_ops.fused_moe.flydsl_mega_experts import MegaFusedExperts
 
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        self.routed_rows_wire = None
+        super().init_prepare_finalize(layer)
+        self.mori_experts = self.fused_experts
         self.fused_experts = MegaFusedExperts(
             layer,
             model_dim=self.hidden_size,
@@ -2871,8 +2872,86 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             mtpr=self.moe.max_num_tokens,
             quant="a8w4",
         )
-        # MegaMoE quantizes the bf16 rows itself, inside its dispatch.
-        self.routed_rows_wire = None
+
+    def mega_runs(self, layer: torch.nn.Module, rows: int) -> bool:
+        """Whether Mega, which quantizes activations to MXFP8, takes a step of
+        `rows` rows across the DP group: only where the standard method, on its
+        separated gate/up layout, would quantize them to MXFP4. Below that it
+        runs bf16 activations, and so does the fallback."""
+        from aiter.fused_moe import resolve_activation_dtype
+
+        return (
+            resolve_activation_dtype(
+                self.quant_type,
+                layer._mega_w1.dtype,
+                activation=layer.activation,
+                gate_mode=GateMode.SEPARATED,
+                M=rows,
+            )
+            == dtypes.fp4x2
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        global_num_experts: int = -1,
+        expert_map: torch.Tensor | None = None,
+        apply_router_weight_on_input: bool = False,
+        activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
+        x_scale: torch.Tensor | None = None,
+        scheduled_tokens_gpu: torch.Tensor | None = None,
+        shared_add: torch.Tensor | None = None,
+        shared_ready: torch.cuda.Event | None = None,
+    ) -> torch.Tensor:
+        # The group's rows, the count the standard method's MoE sees for the
+        # same requests: every rank makes the same choice. Without the table
+        # (a TBO ubatch that exchanged none) Mega takes the step, as it always did.
+        context = get_forward_context().context
+        across_dp = None if context is None else context.running_tokens_across_dp
+        if (
+            self.mori_experts is None
+            or across_dp is None
+            or self.mega_runs(layer, sum(across_dp))
+        ):
+            return self.fused_experts(
+                hidden_states=x,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                global_num_experts=global_num_experts,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                x_scale=x_scale,
+            )
+        # w13_weight is emptied and is_guinterleave does not describe Mega's
+        # weights, so the fallback names both: Mega's gate/up-interleaved weights.
+        return self.mori_experts(
+            hidden_states=x,
+            w1=layer._mega_w1,
+            w2=layer._mega_w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            quant_type=self.quant_type,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            expert_mask=layer.expert_mask,
+            w1_scale=layer._mega_w1_scale,
+            w2_scale=layer._mega_w2_scale,
+            bias1=layer.w13_bias,
+            bias2=layer.w2_bias,
+            hidden_pad=self.hidden_pad,
+            intermediate_pad=self.intermediate_pad,
+            moe_extra_args={
+                "gate_mode": GateMode.INTERLEAVE.value,
+                "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
+            },
+            x_scale=x_scale,
+        )
 
     def get_eplb_weight_views(self, layer: torch.nn.Module) -> list[torch.Tensor]:
         """Return expert-major views owned by EPLB."""

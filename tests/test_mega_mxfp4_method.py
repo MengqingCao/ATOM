@@ -290,3 +290,239 @@ def test_mega_backend_uses_global_dispatch_width(monkeypatch):
     assert output == "output"
     assert captured["experts"] == 264
     assert captured["topk"] == 9
+
+
+class _PrepareFinalize:
+    """A MoRI-shaped prepare/finalize that hands the rows straight through."""
+
+    def topk_indices_dtype(self):
+        return None
+
+    def supports_async(self):
+        return False
+
+    def needs_dispatch_output_trim(self):
+        return True
+
+    def prepare(self, hidden, weights, ids, *_args, x_scale=None):
+        return hidden, None, SimpleNamespace(expert_num_tokens="counts"), None, None
+
+    def finalize(self, output, fused_out, *_args):
+        return fused_out
+
+
+def _mega_layer():
+    return SimpleNamespace(
+        # Emptied: Mega's weights replace it.
+        w13_weight=torch.empty(0, dtype=torch.uint8),
+        w2_weight=torch.empty(0, dtype=torch.uint8),
+        _mega_w1=torch.empty(4, 2, dtype=torch.uint8),
+        _mega_w1_scale=torch.empty(4, 3),
+        _mega_w2=torch.empty(4, 5, dtype=torch.uint8),
+        _mega_w2_scale=torch.empty(4, 6),
+        w13_bias=None,
+        w2_bias=None,
+        expert_mask="mask",
+        activation=moe_mod.ActivationType.Swiglu,
+        swiglu_limit=7.0,
+        local_num_experts=4,
+    )
+
+
+@pytest.fixture
+def mega_method(monkeypatch):
+    """A MegaMxfp4MoEMethod after the real init_prepare_finalize, over a
+    pass-through MoRI transport and recording stand-ins for the two kernels."""
+    pytest.importorskip(
+        "triton", reason="MegaMoE imports its Triton row-zeroing kernel"
+    )
+    from importlib import import_module
+
+    from atom.model_ops.fused_moe import flydsl_mega_experts as mega_module
+    from atom.model_ops.fused_moe import modular_kernel
+
+    state = SimpleNamespace(across_dp=None, fused_moe=[], mega=[], resolved=[])
+
+    def resolve(quant_type, w_dtype, *, activation, gate_mode, M):
+        state.resolved.append((quant_type, w_dtype, activation, gate_mode, M))
+        return moe_mod.dtypes.fp4x2 if M >= 256 else torch.bfloat16
+
+    monkeypatch.setattr(
+        import_module("aiter.fused_moe"),
+        "resolve_activation_dtype",
+        resolve,
+        raising=False,
+    )
+
+    def forward_context():
+        return SimpleNamespace(
+            context=SimpleNamespace(
+                running_tokens_across_dp=state.across_dp, is_prefill=False
+            )
+        )
+
+    monkeypatch.setattr(moe_mod, "get_forward_context", forward_context)
+    monkeypatch.setattr(modular_kernel, "get_forward_context", forward_context)
+    monkeypatch.setattr(
+        modular_kernel,
+        "fused_moe",
+        lambda *args, **kwargs: state.fused_moe.append((args, kwargs)) or args[0],
+    )
+    monkeypatch.setattr(
+        mega_module,
+        "run_mega_moe",
+        lambda _layer, hidden, *_args, **kwargs: state.mega.append(kwargs) or hidden,
+    )
+
+    method = object.__new__(moe_mod.MegaMxfp4MoEMethod)
+    method.moe = SimpleNamespace(max_num_tokens=512)
+    method.fused_experts = None
+    method.topk_indices_dtype = None
+    method.quant_type = moe_mod.QuantType.per_1x32
+    method.hidden_size = 16
+    method.intermediate_size = 8
+    method.hidden_pad = 0
+    method.intermediate_pad = 0
+    # The MXFP4 dispatch wire ATOM_MORI_FP4_DISPATCH would set: Mega takes bf16.
+    method.routed_rows_wire = "fp4 wire"
+
+    def make_prepare_finalize():
+        state.wire = method.routed_rows_wire
+        return _PrepareFinalize()
+
+    method.maybe_make_prepare_finalize = make_prepare_finalize
+    method.get_fused_moe_quant_config = lambda _layer: "quant config"
+    state.layer = _mega_layer()
+    method.init_prepare_finalize(state.layer)
+    state.method = method
+    state.mega_module = mega_module
+    state.modular_kernel = modular_kernel
+    return state
+
+
+def _apply(state, rows):
+    x = torch.zeros(rows, 16, dtype=torch.bfloat16)
+    return state.method.apply(
+        state.layer,
+        x,
+        torch.ones(rows, 4),
+        torch.zeros(rows, 4, dtype=torch.int32),
+        global_num_experts=16,
+        activation=moe_mod.ActivationType.Swiglu,
+    )
+
+
+def test_mega_builds_the_mori_kernel_next_to_its_own(mega_method):
+    method = mega_method.method
+    assert isinstance(method.fused_experts, mega_method.mega_module.MegaFusedExperts)
+    assert isinstance(
+        method.mori_experts, mega_method.modular_kernel.FusedMoEModularKernel
+    )
+    # MoRI carries bf16 rows, as the standard EP path carries them and as
+    # Mega's own dispatch takes them.
+    assert mega_method.wire is None
+    assert method.routed_rows_wire is None
+
+
+@pytest.mark.parametrize(
+    ("across_dp", "mega"),
+    [((64, 64, 64, 63), False), ((64, 64, 64, 64), True), ((256, 0, 0, 0), True)],
+)
+def test_mega_takes_a_step_iff_the_standard_method_runs_mxfp4(
+    mega_method, across_dp, mega
+):
+    """The choice asks aiter about the group's rows in the standard method's
+    separated layout, so every rank of the group makes it alike."""
+    mega_method.across_dp = across_dp
+    for local_rows in across_dp:
+        _apply(mega_method, max(local_rows, 1))
+
+    assert len(mega_method.mega) == (4 if mega else 0)
+    assert len(mega_method.fused_moe) == (0 if mega else 4)
+    assert set(mega_method.resolved) == {
+        (
+            moe_mod.QuantType.per_1x32,
+            torch.uint8,
+            moe_mod.ActivationType.Swiglu,
+            moe_mod.GateMode.SEPARATED,
+            sum(across_dp),
+        )
+    }
+    if mega:
+        assert {kwargs["act"] for kwargs in mega_method.mega} == {"swigluoai"}
+        assert {kwargs["swiglu_limit"] for kwargs in mega_method.mega} == {7.0}
+
+
+def test_the_fallback_runs_fused_moe_on_megas_interleaved_weights(mega_method):
+    layer = mega_method.layer
+    mega_method.across_dp = (2, 2, 2, 2)
+    _apply(mega_method, 2)
+
+    ((args, kwargs),) = mega_method.fused_moe
+    assert args[1] is layer._mega_w1
+    assert args[2] is layer._mega_w2
+    assert kwargs["w1_scale"] is layer._mega_w1_scale
+    assert kwargs["w2_scale"] is layer._mega_w2_scale
+    assert kwargs["gate_mode"] == moe_mod.GateMode.INTERLEAVE.value
+    assert kwargs["swiglu_limit"] == 7.0
+    assert args[6] == moe_mod.ActivationType.Swiglu
+    assert not mega_method.mega
+
+
+def test_without_the_group_table_mega_takes_the_step(mega_method):
+    _apply(mega_method, 8)
+
+    assert len(mega_method.mega) == 1
+    assert not mega_method.fused_moe and not mega_method.resolved
+
+
+def test_the_fallback_runs_bf16_at_every_row_count_it_serves(monkeypatch):
+    """aiter's own resolver, on Mega's own weights: every group row count the
+    choice leaves to the fallback is one fused_moe runs in bf16, as the
+    standard method does there (gfx950, the arch Mega runs on)."""
+    fused_moe = pytest.importorskip("aiter.fused_moe")
+    if not hasattr(fused_moe, "resolve_activation_dtype"):
+        pytest.skip("AITER without resolve_activation_dtype")
+    from aiter import ActivationType, QuantType, dtypes
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    from atom.model_ops.fused_moe.flydsl_mega_experts import build_mega_weights
+
+    monkeypatch.setattr(fused_moe, "get_gfx_runtime", lambda: "gfx950")
+    experts, inter, hidden = 2, 128, 256
+    layer = SimpleNamespace(
+        w13_weight=torch.zeros(experts, 2 * inter, hidden // 2, dtype=torch.uint8).view(
+            dtypes.fp4x2
+        ),
+        w13_weight_scale=torch.zeros(
+            experts, 2 * inter, hidden // 32, dtype=torch.uint8
+        ),
+        w2_weight=torch.zeros(experts, hidden, inter // 2, dtype=torch.uint8).view(
+            dtypes.fp4x2
+        ),
+        w2_weight_scale=torch.zeros(experts, hidden, inter // 32, dtype=torch.uint8),
+        local_num_experts=experts,
+        activation=ActivationType.Swiglu,
+    )
+    build_mega_weights(layer)
+    method = object.__new__(moe_mod.MegaMxfp4MoEMethod)
+    method.quant_type = QuantType.per_1x32
+
+    served = [m for m in range(1, 4097) if not method.mega_runs(layer, m)]
+    assert served == list(range(1, len(served) + 1)) and served
+    w1 = layer._mega_w1
+    for m in served:
+        # fused_moe's own call, as the fallback makes it.
+        assert (
+            fused_moe.resolve_activation_dtype(
+                QuantType.per_1x32,
+                w1.dtype,
+                activation=ActivationType.Swiglu,
+                gate_mode=GateMode.INTERLEAVE,
+                M=m,
+                hidden_dtype=torch.bfloat16,
+                has_a1_scale=False,
+                gate_up_interleave=getattr(w1, "gate_up_interleave", None),
+            )
+            == dtypes.bf16
+        ), m

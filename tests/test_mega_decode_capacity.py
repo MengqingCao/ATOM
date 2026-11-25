@@ -57,6 +57,9 @@ def runtime(monkeypatch):
         events=[],
         instances={},
         layer=_layer(),
+        # bf16_wire of each small-input route an instance builds.
+        small_route_wires=(),
+        max_tokens=[],
     )
     monkeypatch.setenv("ATOM_MEGA_DECODE_FAST_PATH", "1")
     monkeypatch.setattr(plugin_prepare, "_CURRENT_FRAMEWORK", "atom")
@@ -81,12 +84,27 @@ def runtime(monkeypatch):
             assert not state.capturing, "constructor reached during capture"
             self.rank = kwargs["rank"]
             self.capacity = kwargs["max_tok_per_rank"]
+            self.kwargs = kwargs
+            self._small_m_runtimes = [
+                SimpleNamespace(
+                    _configs={
+                        # None: an aiter whose configs have no such knob.
+                        1: SimpleNamespace(
+                            fused_stage1=SimpleNamespace(
+                                **({} if wire is None else {"bf16_wire": wire})
+                            )
+                        )
+                    }
+                )
+                for wire in state.small_route_wires
+            ]
             state.events.append(("build", self.rank, self.capacity))
             state.instances[self.rank, self.capacity] = self
 
-        def forward(self, x, weights, ids, *, mask_invalid_slots):
+        def forward(self, x, weights, ids, *, mask_invalid_slots, max_tokens):
             # Pad rows are routed to -1, so combine must skip those slots.
             assert mask_invalid_slots is True
+            state.max_tokens.append(max_tokens)
             state.events.append(("forward", self.rank, self.capacity))
             return torch.full_like(x, self.capacity)
 
@@ -111,6 +129,7 @@ def runtime(monkeypatch):
         experts=384,
         mtpr=LARGE_CAPACITY,
         layer=None,
+        **kwargs,
     ):
         state.manager.rank = rank
         state.manager.world_size = world
@@ -127,7 +146,7 @@ def runtime(monkeypatch):
             experts=experts,
             topk=6,
             mtpr=mtpr,
-            swiglu_limit=0.0,
+            **{"swiglu_limit": 0.0, **kwargs},
         )
 
     state.run = run
@@ -348,3 +367,61 @@ def test_cached_capacities_rebind_layer_weights_without_breaking_eplb_aliases(ru
     next_layer._mega_w1[0].fill_(9)
     for instance in runtime.instances.values():
         assert torch.all(instance._s1_w1[0] == 9)
+
+
+def test_instances_route_with_a_bf16_combine_wire(runtime):
+    runtime.run(_context(64), world=4, experts=128, act="swigluoai", swiglu_limit=7.0)
+
+    (instance,) = runtime.instances.values()
+    assert instance.kwargs["act"] == "swigluoai"
+    assert instance.kwargs["swiglu_limit"] == 7.0
+    assert instance.kwargs["routed"] is True
+    assert instance.kwargs["large_m_enabled"] is False
+    assert instance.kwargs["stage2_p2p_quant"] == "none"
+
+
+def test_cache_key_separates_activations_and_limits(runtime):
+    pairs = [("silu", 7.0), ("swigluoai", 7.0), ("swigluoai", 10.0)]
+    for act, limit in pairs * 2:
+        runtime.run(_context(64), world=4, experts=128, act=act, swiglu_limit=limit)
+
+    # One instance per (act, limit), each built once and reused after.
+    assert len(_built(runtime)) == 3
+    assert len(mega._MEGA_CACHE) == 3
+    assert (
+        sorted(
+            (m.kwargs["act"], m.kwargs["swiglu_limit"])
+            for m in mega._MEGA_CACHE.values()
+        )
+        == pairs
+    )
+
+
+@pytest.mark.parametrize(
+    ("wires", "routed"),
+    [((True, True), True), ((True, False), False), ((), False), ((None,), False)],
+)
+def test_max_tokens_is_the_group_max_only_over_bf16_small_routes(
+    runtime, wires, routed
+):
+    """A small-input route without a bf16 wire could send FP8 rows; such an
+    instance keeps the staged route, whose wire `stage2_p2p_quant` pins."""
+    runtime.small_route_wires = wires
+    # Every rank passes the group's largest rows, not its own.
+    for rank, local_rows in enumerate((40, 64, 8, 0)):
+        runtime.run(
+            _context(local_rows, running_tokens_across_dp=(40, 64, 8, 0)),
+            rank=rank,
+            world=4,
+            experts=128,
+        )
+
+    assert runtime.max_tokens == [64 if routed else None] * 4
+
+
+def test_max_tokens_needs_the_group_table(runtime):
+    runtime.small_route_wires = (True,)
+    runtime.run(None, rows=8, world=4, experts=128)
+    runtime.run(_context(8), world=4, experts=128)
+
+    assert runtime.max_tokens == [None, None]

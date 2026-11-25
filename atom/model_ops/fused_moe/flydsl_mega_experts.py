@@ -15,9 +15,10 @@ power of two. The configured ``max_num_tokens`` remains the fallback capacity.
 For native ATOM EP8 with 48 experts per rank, DP-unified forwards with at most 128
 padded token rows can use a second, 128-token instance. Target verification
 and draft passes use their own token counts, including MTP and graph padding.
-MTPR also selects the p2p wire format, so the choice must use group-agreed
-metadata, never a rank's local request count. Set ATOM_MEGA_DECODE_FAST_PATH=0
-to retain the configured capacity for all forwards.
+MTPR also selects the p2p protocol (the combine wire is bf16 at every MTPR),
+so the choice must use group-agreed metadata, never a rank's local request
+count. Set ATOM_MEGA_DECODE_FAST_PATH=0 to retain the configured capacity for
+all forwards.
 
 Weight prep uses aiter's own shuffles (``aiter.ops.shuffle``):
   w1/w1_scale: ``shuffle_weight_a16w4(., 16, gate_up=True)`` /
@@ -125,6 +126,22 @@ def build_mega_weights(layer) -> None:
         )
 
 
+def _small_input_routes_send_bf16(mega) -> bool:
+    """Whether `mega` has small-input routes and all combine over a bf16 wire.
+
+    `stage2_p2p_quant` governs only the staged route; a small-input route picks
+    its wire from its own tuned config (`bf16_wire`), and without it sends FP8
+    rows for a hot expert or many received rows. Only an instance this returns
+    True for is called with `max_tokens`; the others stay on the staged route.
+    """
+    runtimes = getattr(mega, "_small_m_runtimes", ())
+    return bool(runtimes) and all(
+        getattr(config.fused_stage1, "bf16_wire", False)
+        for runtime in runtimes
+        for config in runtime._configs.values()
+    )
+
+
 def get_or_build_mega_moe(
     *,
     rank,
@@ -136,16 +153,17 @@ def get_or_build_mega_moe(
     quant,
     mtpr,
     swiglu_limit,
+    act="silu",
     w1,
     w1_scale,
     w2,
     w2_scale,
 ):
-    # swiglu_limit belongs in the key: aiter bakes the clamp into the GEMM1
-    # kernel at trace time (gemm_util.py `if self._swiglu_limit <= 0`), so two
-    # layers with different limits cannot share one instance. Without it in the
-    # key they would silently reuse whichever limit was built first -- wrong
-    # numerics, no error.
+    # act and swiglu_limit belong in the key: aiter bakes the activation and its
+    # clamp into the GEMM1 kernel at trace time (gemm_util.py
+    # `if self._swiglu_limit <= 0`), so two layers that differ in either cannot
+    # share one instance. Without them in the key they would silently reuse
+    # whichever was built first -- wrong numerics, no error.
     key = (
         rank,
         world_size,
@@ -156,6 +174,7 @@ def get_or_build_mega_moe(
         quant,
         mtpr,
         swiglu_limit,
+        act,
     )
     m = _MEGA_CACHE.get(key)
     if m is None:
@@ -183,14 +202,26 @@ def get_or_build_mega_moe(
                 w2_scale=w2_scale,
                 max_tok_per_rank=mtpr,
                 swiglu_limit=swiglu_limit,
+                act=act,
+                # A call passes the DP group's largest rows (`forward(max_tokens=)`),
+                # so every rank takes the same route. The large-input route is not
+                # captured in graphs, so it stays off.
+                routed=True,
+                large_m_enabled=False,
+                # The combine wire stays bf16 at every capacity.
+                stage2_p2p_quant="none",
             )
+        m.atom_routes = _small_input_routes_send_bf16(m)
         _MEGA_CACHE[key] = m
         if rank == 0:
             logger.info(
-                "[MEGA-CAPACITY] built capacity=%d, ep=%d, experts/rank=%d",
+                "[MEGA-CAPACITY] built capacity=%d, ep=%d, experts/rank=%d, "
+                "act=%s, small-input routes (bf16 wire)=%s",
                 mtpr,
                 world_size,
                 experts // world_size,
+                act,
+                m.atom_routes,
             )
 
     # Bind this layer's weights on EVERY call, not only on build: the cache key
@@ -222,6 +253,7 @@ def run_mega_moe(
     topk: int,
     mtpr: int,
     swiglu_limit: float,
+    act: str = "silu",
     quant: str = "a8w4",
 ) -> torch.Tensor:
     """Replace EP experts with MegaMoEV2. x: [tokens, model_dim] bf16 (this rank's
@@ -240,7 +272,7 @@ def run_mega_moe(
     if run_tokens > mtpr:
         raise ValueError(
             f"[mega] run_tokens={run_tokens} exceeds mtpr={mtpr} "
-            f"(max_num_tokens); widening mtpr here would diverge the p2p wire "
+            f"(max_num_tokens); widening mtpr here would diverge the p2p protocol "
             f"format across ranks"
         )
     if not hasattr(layer, "_mega_w1"):
@@ -255,6 +287,7 @@ def run_mega_moe(
         "topk": topk,
         "quant": quant,
         "swiglu_limit": float(swiglu_limit),
+        "act": act,
         "w1": layer._mega_w1,
         "w1_scale": layer._mega_w1_scale,
         "w2": layer._mega_w2,
@@ -311,13 +344,26 @@ def run_mega_moe(
                     selected_mtpr,
                 )
 
+    # The route follows the DP group's largest rank's rows, the same number on
+    # every rank; a rank's own rows would let peers take different routes.
+    # Plugin bridges do not all publish that table (see above).
+    max_tokens = None
+    if mega.atom_routes and not is_plugin_mode():
+        from atom.utils.forward_context import get_forward_context
+
+        context = get_forward_context().context
+        if context is not None and context.running_tokens_across_dp is not None:
+            max_tokens = max(context.running_tokens_across_dp)
+
     wts = topk_weights.to(torch.float32).contiguous()
     ids = topk_ids.to(torch.int32).contiguous()
     with torch.inference_mode(False), torch.no_grad():
         # swiglu_limit is NOT a forward arg -- it is baked into the instance at
         # construction (see the cache key above). Routing sends a pad row's
         # slots to -1, which combine must skip rather than sum stale data from.
-        out = mega.forward(x.contiguous(), wts, ids, mask_invalid_slots=True)
+        out = mega.forward(
+            x.contiguous(), wts, ids, mask_invalid_slots=True, max_tokens=max_tokens
+        )
     return out
 
 
@@ -380,9 +426,10 @@ class MegaFusedExperts:
             raise NotImplementedError(
                 "mega does not support apply_router_weight_on_input=True"
             )
-        if activation is not None and activation != ActivationType.Silu:
+        acts = {ActivationType.Silu: "silu", ActivationType.Swiglu: "swigluoai"}
+        if activation is not None and activation not in acts:
             raise NotImplementedError(
-                f"mega hardcodes SwiGLU; got activation={activation}"
+                f"mega runs SiLU or SwiGLU-OAI gating; got activation={activation}"
             )
         # w1/w2 are the emptied AITER staging buffers -- mega reads layer._mega_*.
         # expert_map is intentionally unused: Mega consumes backend dispatch ids,
@@ -411,5 +458,6 @@ class MegaFusedExperts:
             # token count; request count alone is insufficient under MTP.
             mtpr=self._mtpr,
             swiglu_limit=getattr(self._layer, "swiglu_limit", 0.0),
+            act=acts.get(activation, "silu"),
             quant=self._quant,
         )

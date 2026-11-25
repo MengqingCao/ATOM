@@ -215,10 +215,13 @@ def get_or_build_mega_moe(
         _MEGA_CACHE[key] = m
         if rank == 0:
             logger.info(
-                "[MEGA-CAPACITY] built capacity=%d, ep=%d, experts/rank=%d",
+                "[MEGA-CAPACITY] built capacity=%d, ep=%d, experts/rank=%d, "
+                "act=%s, small-input routes (bf16 wire)=%s",
                 mtpr,
                 world_size,
                 experts // world_size,
+                act,
+                m.atom_routes,
             )
 
     # Bind this layer's weights on EVERY call, not only on build: the cache key

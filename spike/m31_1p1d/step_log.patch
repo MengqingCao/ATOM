@@ -1,0 +1,50 @@
+From fff1ef280bacfeaef1e6edd2b54033371f5bd5b8 Mon Sep 17 00:00:00 2001
+From: spike <spike@local>
+Date: Wed, 25 Nov 2026 07:53:45 +0000
+Subject: [PATCH] spike #35: ATOM_SPIKE_STEP_LOG per-step DP rows recorder
+ (local only)
+
+---
+ atom/utils/forward_context.py | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/atom/utils/forward_context.py b/atom/utils/forward_context.py
+index 6ae5d568c..c6c1e5847 100644
+--- a/atom/utils/forward_context.py
++++ b/atom/utils/forward_context.py
+@@ -2,6 +2,7 @@
+ # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+ 
+ import logging
++import os
+ import threading
+ from collections.abc import Container
+ from contextlib import contextmanager
+@@ -19,6 +20,12 @@ from atom.utils import region_graph
+ from atom.utils.tbo.ubatch_splitting import UBatchSlice, decode_bucket_splits
+ from atom.utils.tbo.ubatching import sync_dp_metadata
+ 
++_STEP_LOG = (
++    open("%s.%d" % (os.environ["ATOM_SPIKE_STEP_LOG"], os.getpid()), "w", buffering=1 << 16)
++    if os.environ.get("ATOM_SPIKE_STEP_LOG")
++    else None
++)
++
+ if TYPE_CHECKING:
+     from atom.distributed.pcp_utils import PcpBalGroup
+     from atom.model_ops.dcp_ops import DcpSparsePrefillKV
+@@ -367,6 +374,11 @@ class ForwardMode:
+         if unified:
+             # Every rank runs the group's height.
+             running_tokens_per_dp_rank.fill(running_tokens)
++        if _STEP_LOG is not None and dp_size > 1:
++            # spike #35: one line per step, every rank's scheduled tokens and the padded rows.
++            _STEP_LOG.write("%s %d %d %d\n" % (
++                ",".join(map(str, sync.scheduled_tokens_per_dp_rank.tolist())),
++                int(sync.any_rank_has_prefill), running_bs, running_tokens))
+         return cls(
+             use_cudagraph=use_cudagraph,
+             is_prefill=is_prefill,
+-- 
+2.43.0
+

@@ -22,7 +22,9 @@ upstream PRs by hand.
   (AgentX, c140/c150 load); the operator microbenchmark is the MegaMoE operator's own acceptance.
   Any other 4-GPU decode-only window is a step microbenchmark for traces and tuning, never a verdict.
 - Numerics (InferenceX M3.1 compliance; anything needing an accuracy proof is out): native MXFP8
-  linears, no PTPC; FP8 KV and FP8 index cache; index top-k on every layer; bf16 all-reduce and bf16
+  linears, no PTPC; FP8 or NVFP4 KV cache and FP8 or NVFP4 index cache, never MXFP4 for either
+  (ruling: https://github.com/MengqingCao/ATOM/issues/14#issuecomment-7181744233); index top-k on
+  every layer; bf16 all-reduce and bf16
   MegaMoE combine wire; shared expert as its own MXFP8 MLP; DSpark k=7 as shipped; MoE on the
   checkpoint's MXFP4 path, never moved to a lower-precision path. An optimization is bit-identical
   or no worse versus fp32 than the code it replaces.

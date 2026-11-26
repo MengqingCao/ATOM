@@ -432,7 +432,10 @@ def test_mega_quant_follows_the_a4w4_env(mega_method, monkeypatch, env, quant):
         monkeypatch.delenv("ATOM_MEGA_A4W4", raising=False)
     else:
         monkeypatch.setenv("ATOM_MEGA_A4W4", env)
-    mega_method.method.init_prepare_finalize(mega_method.layer)
+    # Rebuild from the state the fixture started in, now under the env.
+    method = mega_method.method
+    method.fused_experts = method.topk_indices_dtype = None
+    method.init_prepare_finalize(mega_method.layer)
     mega_method.across_dp = (64, 64, 64, 64)
     _apply(mega_method, 64)
 

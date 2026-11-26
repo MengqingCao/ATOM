@@ -42,3 +42,32 @@ for a, b in (("printf '%s\\n' \"${ATOMESH_RESTART_PORT_OFFSET}\"",
     s = s.replace(a, b)
 open(p, "w").write(s)
 PY
+# ATOM#81 fixed-length cell (run_pd.sh KIND=fixed, the AgentX cell's P/D topology): plain aiperf synthetic prompts,
+# ISL FIXED_ISL (131072) / OSL FIXED_OSL (2048), both stddev 0, ignore_eos; one unique prompt a request
+# (dataset entries = warmup + measured requests); prefix caching off on P and D. Closed loop at CONC: CONC warmup
+# requests, then CONC x FIXED_REQ_MULT (5) measured ones; pd_report.py's window ends at "sending complete".
+if [[ "${KIND}" == fixed ]]; then
+  export ENABLE_PREFIX_CACHING=false
+  python3 - .github/scripts/atomesh/pd_server_atom.sh "${FIXED_ISL:-131072}" "${FIXED_OSL:-2048}" "${FIXED_REQ_MULT:-5}" <<'PY'
+import sys
+p, isl, osl, mult = sys.argv[1:]
+s = open(p).read()
+a = '      "${AGENTX_VENV}/bin/agentx" profile \\\n'
+b = '      --public-dataset "${AIPERF_PUBLIC_DATASET}" \\\n'
+i, j = s.find(a), s.find(b)
+assert s.count(a) == 1 and s.count(b) == 1 and i < j, "agentx profile call in pd_server_atom.sh changed"
+k = '      "${server_metrics_args[@]}" \\\n      --output-artifact-dir "${out_dir}" \\\n'
+assert k in s[i:j], "aiperf output args in pd_server_atom.sh changed"
+n = f"$(( conc * {mult} ))"
+new = ('      "${AGENTX_VENV}/bin/aiperf" profile \\\n'
+       '      --url "http://127.0.0.1:${ROUTER_PORT}" --endpoint /v1/chat/completions --endpoint-type chat --streaming \\\n'
+       '      --model "${MODEL_PATH}" --tokenizer "${MODEL_PATH}" --tokenizer-trust-remote-code \\\n'
+       f'      --concurrency "${{conc}}" --warmup-request-count "${{conc}}" --request-count "{n}" \\\n'
+       f'      --num-dataset-entries "$(( conc + {n} ))" --random-seed 42 \\\n'
+       f'      --isl {isl} --isl-stddev 0 --osl {osl} --osl-stddev 0 --extra-inputs ignore_eos:true \\\n'
+       '      --use-server-token-count --no-gpu-telemetry --stats-interval 30 \\\n'
+       '      --failed-request-threshold "${AIPERF_FAILED_REQUEST_THRESHOLD}" --slice-duration "${AIPERF_SLICE_DURATION}" \\\n'
+       + k)
+open(p, "w").write(s[:i] + new + s[j + len(b):])
+PY
+fi

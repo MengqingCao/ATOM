@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Unattended #35 queue on ONE whole node, run detached on the dev host:
+# Unattended #81 queue on ONE whole node, run detached on the dev host:
 #   setsid nohup bash driver.sh > $S/driver.log 2>&1 < /dev/null &
-# acquire (-g 8 --wait) -> smoke B2-c150-r1 -> AgentX matrix (A/B1/B2 x c140/c150 x r1,r2, 1200 s) -> traced runs
-# -> GSM8K-200 (c32, 3 a arm; gsmB2r1 traced) -> A1 rerun (a1.sh, POINTS_EXTRA = B2's per-rank rows).
-# One line a run in $S/driver_status.txt. Stops on the first AgentX run without client data (a run past
-# duration + WD_MARGIN s, 1800 by default, or a gsm8k run past 3600 s, is stopped by the watchdog and counts as invalid), or on YIELD;
+# acquire (-g 8 --wait) -> smoke B2-c45-r1 (gate: decode batch >= 0.8 x 45, else stop for a ruling) -> A/B1/B2 x c45/c64 x r1,r2,
+# all KIND=fixed (aiperf synthetic ISL 128k / OSL 2k, ov_spike.sh). One line a run in $S/driver_status.txt. Stops on the first
+# run without client data (a run past 1200 + WD_MARGIN s is stopped by the watchdog and counts as invalid), or on YIELD;
 # always cleans its own containers and releases the lease (trap). A node whose GPUs a foreign (unleased) process
 # uses is released with --force and skipped; the queue re-acquires elsewhere, at most MAXTRIES grants in all.
 set -uo pipefail
-S=/share_nfs/mengqing/code/tmp/m31-decode-dep4/35; D=$(dirname "$(readlink -f "$0")")
+S=/share_nfs/mengqing/code/tmp/m31-decode-dep4/81; D=$(dirname "$(readlink -f "$0")")
 G=/share_nfs/yajizhan/gpu-pool/bin/gpool; ST=$S/driver_status.txt; R=$S/harness/runs
 IMG=mengqing-dep4-35/all:e4858b08e
 LEASE=; HOST=; NODE=; JOB=; done_n=0; why="queue finished"
@@ -25,7 +24,7 @@ finish() {
   [[ -z $LEASE ]] && { log "END no lease: $why"; exit; }
   clean
   for i in 1 2 3 4 5 6 7 8 9 10; do  # release refuses (rc 3) while GPU memory drains
-    $G release "$LEASE" --note "#35 driver: $done_n runs done; $why" && break; sleep 30
+    $G release "$LEASE" --note "#81 driver: $done_n runs done; $why" && break; sleep 30
   done
   : > $S/driver_lease; log "END released $LEASE on $NODE: $why"
 }
@@ -44,7 +43,7 @@ foreign() {
     else u=$(ps -o uid= -p $p | tr -d " "); [ -n "$u" ] && [ "$u" != "$(id -u)" ] && echo "pid $p uid $u"; fi
   done' | sort -u | grep -vE "^container (mengqing-dep4-35-|atomesh-.*-(${jobs:-NONE})-[0-9]+)"
 }
-bad=; tries=0; MAXTRIES=8; PREF=${PREF:-g27 g53}  # most cache-heavy nodes fail the MemFree check below
+bad=; tries=0; MAXTRIES=8; PREF=${PREF:-g53 g27}  # most cache-heavy nodes fail the MemFree check below
 # Take a whole node (never one in $bad), get the image on it, and check no one else is on its GPUs.
 grant() {
   local nodes out who
@@ -57,7 +56,7 @@ grant() {
     log "START acquiring a whole node (attempt $tries, nodes $nodes)"
     local arc stale=0
     while :; do  # an NFS "Stale file handle" (errno 116) in gpool is transient: retry it, at most 5 times
-      out=$($G acquire -g 8 --node "$nodes" -p "MengqingCao/ATOM#35 spike: M3.1 1P1D A/B1/B2 AgentX c140/c150 + GSM8K-200 + A1 rerun, prefill 2 TB Mooncake CPU KV tier (~10h)" --wait --timeout $to 2>&1); arc=$?
+      out=$($G acquire -g 8 --node "$nodes" -p "MengqingCao/ATOM#81 spike: M3.1 1P1D A/B1/B2 aiperf fixed ISL 128k/OSL 2k c45/c64 x2, prefill 2 TB Mooncake CPU KV tier (~5h)" --wait --timeout $to 2>&1); arc=$?
       ((arc == 0)) && break
       echo "$out"
       [[ $arc == 2 && -n $PREF ]] && { log "no grant on preferred $nodes in $to: any free node next"; PREF=; tries=$((tries - 1)); continue 2; }
@@ -85,10 +84,10 @@ grant() {
 drop() {
   log "BUSY $NODE $LEASE: gpus busy by foreign process: $1"
   clean
-  $G release "$LEASE" --force --note "#35 driver: GPUs busy with a foreign unleased process ($1), nothing of ours ran; re-queuing elsewhere"
+  $G release "$LEASE" --force --note "#81 driver: GPUs busy with a foreign unleased process ($1), nothing of ours ran; re-queuing elsewhere"
   : > $S/driver_lease; log "END released $LEASE on $NODE: foreign process"; bad="$bad $NODE"; LEASE=
 }
-log "CONFIG #35 ruling 7183814426, all arms, P and D: --kv-cache-dtype nvfp4 --index-cache-dtype nvfp4 (was fp8/fp8; FP8 reference runs in harness/runs-fp8/), DSpark draft KV --spec-decode-kv-cache-dtype fp8 (as the FP8 runs; engine default under nvfp4 would be bf16); ruling 7167528921: prefill KV CPU tier = Mooncake Store 2 TB = 1863 GiB host DRAM (MOONCAKE_STORE=1, owners 0:465:rdma4;0:465:rdma5;1:465:rdma6;1:465:rdma7, 930 GiB a NUMA node under the ~1017 GiB huge-page ceiling; ATOM_KV_OFFLOAD=mooncake_store via launcher; decode no tier); ruling 7164687062: decode DP session affinity off (no dp_sticky/--dp-aware/X-Session-ID; router policy random), AgentX warmup_requests_per_lane=1 (was 10), window 1200 s, warmup_grace_period 1800 s; watchdog agentx duration+${WD_MARGIN:-1800} s, gsm8k 3600 s"
+log "CONFIG #81: #35 setup (NVFP4 KV + NVFP4 index on P and D, DSpark draft KV fp8, 2 TB Mooncake Store prefill tier, decode DP session affinity off, forced AL 4.04) with aiperf synthetic ISL 131072 / OSL 2048 (stddev 0, ignore_eos, unique prompt a request, prefix caching off on P and D), CONC warmup + 5 x CONC measured requests; watchdog duration+${WD_MARGIN:-1800} s"
 grant
 
 yield() { $G mine | grep "$LEASE" | grep -q YIELD; }
@@ -100,7 +99,7 @@ run() {
   yield && { why="lease YIELD before '$spec'"; exit 0; }
   set -- ${spec#TRACE=1:}; tag=$1 kind=$3
   # Watchdog: server start (~8 min) + 1-per-lane warmup + the window + drain must fit in duration + WD_MARGIN s, else the run is stuck.
-  local lim=$((SECONDS + 3600)); [[ $kind == agentx ]] && lim=$((SECONDS + $5 + ${WD_MARGIN:-1800}))
+  local lim=$((SECONDS + 3600)); [[ $kind == agentx || $kind == fixed ]] && lim=$((SECONDS + $5 + ${WD_MARGIN:-1800}))
   who=$(foreign | paste -sd';')
   [[ -n $who ]] && { log "RUN $tag skipped: gpus busy by foreign process: $who"; drop "$who"; grant; run "$spec"; return; }
   t0=$(date -u +%FT%TZ)
@@ -123,7 +122,7 @@ run() {
   [[ -z $JOB && -f $dir/run.txt ]] && JOB=$(grep -o 'job=[0-9]*' "$dir/run.txt" | cut -d= -f2)
   if [[ $spec == TRACE=1:* ]]; then  # a traced run gives the trace only
     [[ -n $(find "$dir" -path '*torch_traces*' -type f 2>/dev/null | head -1) ]] && valid=yes || valid=no
-  elif [[ $kind == agentx ]]; then
+  elif [[ $kind == agentx || $kind == fixed ]]; then
     python3 -c "import json,sys;sys.exit(not json.load(open('$dir/report.json'))['client'])" 2>/dev/null && valid=yes || valid=no
   else
     [[ $rc == 0 && -s $S/acc/mtp_$tag.json ]] && valid=yes || valid=no
@@ -140,39 +139,15 @@ run() {
   [[ $valid == yes ]]
 }
 
-run 'B2-c150-r1 B2 agentx 150 1200' || { why="smoke B2-c150-r1 invalid: diagnose"; exit 1; }
-# The smoke must show the CPU tier in use and a higher prefix hit than the no-tier smoke (41.46 %, pd-B2-c150-r1-20261125141241).
-hit=$(python3 -c "import json;p=json.load(open('$dir/report.json'))['prefill'];print(p.get('offload_hit_pct'),p.get('total_hit_pct'))" 2>/dev/null)
-log "SMOKE prefill hit: offload(CPU tier) total = ${hit:-none} %"
-python3 -c "import sys;o,t=map(float,'$hit'.split());sys.exit(not (o > 0 and t > 41.46))" 2>/dev/null \
-  || { why="smoke B2-c150-r1: CPU tier not in use or prefix hit not above 41.46 % ($hit): diagnose"; exit 1; }
-for r in 1 2; do for c in 140 150; do for a in A B1 B2; do
-  [[ $a$c$r == B21501 ]] && continue
-  run "$a-c$c-r$r $a agentx $c 1200" || { why="$a-c$c-r$r invalid: diagnose"; exit 1; }
+# Smoke = B2-c45-r1, kept as the matrix's first run when it passes. With 128k unique prompts one PP4 prefill may not feed
+# 45 decode rows: below 0.8 x CONC decode running batch (window mean) the point is prefill-bound, so stop for a ruling on #81.
+run 'B2-c45-r1 B2 fixed 45 1200' || { why="smoke B2-c45-r1 invalid: diagnose"; exit 1; }
+grep -rqs -- '--no-enable_prefix_caching' "$dir"/slurm_job-*/logs || { why="smoke B2-c45-r1: prefix caching not off: diagnose"; exit 1; }
+sm=$(python3 -c "import json;d=json.load(open('$dir/report.json'));e=d['decode'];print(e.get('batch_mean_all', e.get('batch_mean')), e.get('batch_mean'), e.get('batch_p90'), d['prefill'].get('computed_tok_s'), d['client'].get('req_s'), d['client'].get('out_tok_s_per_gpu'))" 2>/dev/null)
+log "SMOKE decode batch mean(all) mean(busy) p90, prefill computed tok/s, req/s, out tok/s/GPU = ${sm:-none} (CONC 45)"
+python3 -c "import sys;sys.exit(not float('${sm%% *}') >= 0.8 * 45)" 2>/dev/null \
+  || { why="smoke B2-c45-r1: decode batch ${sm%% *} < 36 of 45, prefill-bound: ruling needed on #81"; exit 1; }
+for r in 1 2; do for c in 45 64; do for a in A B1 B2; do
+  [[ $a$c$r == B2451 ]] && continue
+  run "$a-c$c-r$r $a fixed $c 1200" || { why="$a-c$c-r$r invalid: diagnose"; exit 1; }
 done; done; done
-# Traced AgentX (600 s: the 1-s window opens 300 s in): B2 at both points, plus A and B1 at c150 for the top-two breakdown.
-for s in 'tB2-c140 B2 agentx 140 600' 'tB2-c150 B2 agentx 150 600' 'tB1-c150 B1 agentx 150 600' 'tA-c150 A agentx 150 600'; do
-  run "TRACE=1:$s"
-done
-for r in 1 2 3; do for a in A B1 B2; do
-  if [[ $a$r == B21 ]]; then run "TRACE=1:gsm${a}r$r $a gsm8k 32"; else run "gsm${a}r$r $a gsm8k 32"; fi
-done; done
-
-yield && { why="lease YIELD before A1"; exit 0; }
-python3 "$D/report.py" $R/pd-B2-c1[45]0-r* > $S/report_b2.txt 2>&1
-export POINTS_EXTRA=$(python3 - "$S/report_b2.txt" <<'PY'
-import json, sys
-d, _ = json.JSONDecoder().raw_decode(open(sys.argv[1]).read())
-pts = {}
-for name, row in d.items():
-    for k, st in enumerate(row.get("steps", [])):
-        for q in ("p50", "p90"):
-            v = st[f"req_per_rank_{q}"]
-            if v not in pts.values():
-                pts[f"B2{name.split('@')[1]}r{k + 1}{q}"] = v
-print(json.dumps(pts))
-PY
-)
-log "A1 POINTS_EXTRA=$POINTS_EXTRA"
-t0=$(date -u +%FT%TZ); bash "$D/a1.sh" "$NODE" rerun > $S/a1/rerun.log 2>&1; rc=$?
-done_n=$((done_n + 1)); log "RUN a1-rerun rc=$rc valid=$([[ $rc == 0 ]] && echo yes || echo no) start=$t0 end=$(date -u +%FT%TZ) dir=$S/a1/rerun"

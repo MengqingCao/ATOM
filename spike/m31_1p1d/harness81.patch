@@ -1,0 +1,29 @@
+--- a/bin/run_pd.sh	2026-11-26 05:50:51.681373642 +0000
++++ b/bin/run_pd.sh	2026-11-26 06:10:38.255588296 +0000
+@@ -6,7 +6,7 @@
+ #   ARM  decode arm A | B1 | B2 | T (env.sh); PREFILL_ARM producer arm P (default: PP4 x TP1) | T | B1 | B2
+ #   CONC AgentX concurrency (default 64); DURATION_S profiling seconds (default 1800;
+ #        < 900 is allowed and adds aiperf --unsafe-override)
+-#   KIND agentx (default) | gsm8k (GSM8K 5-shot chat through P/D, real acceptance)
++#   KIND agentx (default) | gsm8k (GSM8K 5-shot chat through P/D, real acceptance) | fixed (ATOM#81: synthetic ISL/OSL)
+ # env:  TREE   ATOM worktree to snapshot (tracked files + uncommitted edits; default env.sh TREE)
+ #       IMAGE  docker image (default env.sh IMAGE); MAXSEQS decode max-num-seqs (default 256)
+ #       EVAL_LIMIT  GSM8K question limit (e.g. 200 = quick mode)
+@@ -22,6 +22,7 @@
+ case "${KIND}" in
+   agentx) CELL=m31d-1p1d-agentx ;;
+   gsm8k) CELL=m31d-1p1d-gsm8k ;;
++  fixed) CELL=m31d-1p1d-agentx ;;  # ATOM#81: the AgentX cell with aiperf synthetic fixed-length prompts (cells/ov_spike.sh)
+   *) echo "bad KIND ${KIND}" >&2; exit 2 ;;
+ esac
+ DEC_ARGS="$(arm_args "${ARM}")"; DEC_ENV="$(arm_env "${ARM}")"
+--- a/bin/env.sh	2026-11-25 07:53:08.458018904 +0000
++++ b/bin/env.sh	2026-11-26 06:10:22.214976406 +0000
+@@ -1,6 +1,6 @@
+ # Shared settings for the M3.1 decode A/B harness. Sourced by the other scripts
+ # (on the host and inside containers). Override any variable from the caller.
+-H=/share_nfs/mengqing/code/tmp/m31-decode-dep4/35/harness
++H=/share_nfs/mengqing/code/tmp/m31-decode-dep4/81/harness
+ MODEL=${MODEL:-/share_nfs/models/amd/MiniMax-M3.1-Flash-Quark-MXFP4}
+ IMAGE=${IMAGE:-rocm/atom-dev:nightly_202611211511}
+ TREE=${TREE:-/share_nfs/mengqing/code/tmp/m31-decode-dep4/35/run-tree/atom}

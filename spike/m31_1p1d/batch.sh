@@ -3,7 +3,7 @@
 # TRACE=1 in a spec's env (prefix "TRACE=1:TAG ...") traces it. A gsm8k run keeps the decode server's last
 # /debug/mtp_stats (real acceptance) in <S>/acc/mtp_<TAG>.json; a traced gsm8k run also takes a 2-s decode
 # profiler window once 20,000 draft tokens are in (the launcher opens windows only in AgentX runs).
-S=/share_nfs/mengqing/code/tmp/m31-decode-dep4/35; D=$(dirname "$(readlink -f "$0")")
+S=/share_nfs/mengqing/code/tmp/m31-decode-dep4/81; D=$(dirname "$(readlink -f "$0")")
 mkdir -p $S/acc $S/logs
 for spec; do
   tr=; [[ "$spec" == TRACE=1:* ]] && { tr=1; spec=${spec#TRACE=1:}; }

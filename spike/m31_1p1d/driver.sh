@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Unattended #81 queue on ONE whole node, run detached on the dev host:
 #   setsid nohup bash driver.sh > $S/driver.log 2>&1 < /dev/null &
-# acquire (-g 8 --wait) -> A/B1/B2 x c45/c64 x r1,r2 minus B2-c45-r1 (done), no smoke gate (ruling 7185214449),
+# acquire g53 (-g 8 --wait) -> the runs left after the owner's ruling 7188551385 (r2 dropped): B2-c64-r1, and B2-c45-r1b
+# (the c45 B2 number on g53, next to A-c45-r1/B1-c45-r1; the g27 smoke keeps B2-c45-r1), no smoke gate (ruling 7185214449),
 # all KIND=fixed (aiperf: one shared 127k prefix + unique 1k tail = 128k context, OSL 2k, prefix caching on; ov_spike.sh). One line a run in $S/driver_status.txt. Stops on the first
 # run without client data (a run not at aiperf in 75 min, or past 1200 + WD_MARGIN s after, is stopped by the watchdog and counts as invalid), or on YIELD;
 # always cleans its own containers and releases the lease (trap). A node whose GPUs a foreign (unleased) process
@@ -43,23 +44,21 @@ foreign() {
     else u=$(ps -o uid= -p $p | tr -d " "); [ -n "$u" ] && [ "$u" != "$(id -u)" ] && echo "pid $p uid $u"; fi
   done' | sort -u | grep -vE "^container (mengqing-dep4-35-|atomesh-.*-(${jobs:-NONE})-[0-9]+)"
 }
-bad=; tries=0; MAXTRIES=8; PREF=${PREF:-g53 g27}  # most cache-heavy nodes fail the MemFree check below
+bad=; tries=0; MAXTRIES=8; PREF=${PREF:-g53}  # one node for the whole A/B1/B2 comparison
 # Take a whole node (never one in $bad), get the image on it, and check no one else is on its GPUs.
 grant() {
   local nodes out who
   while :; do
     tries=$((tries + 1)); ((tries > MAXTRIES)) && { why="no clean node after $MAXTRIES grants (busy: ${bad:-none})"; exit 1; }
     # g27 and g53 pass the per-NUMA MemFree check below: ask for them (queueing) first, any free node after that.
-    nodes=$(for n in $PREF; do [[ " $bad " == *" $n "* ]] || echo $n; done | paste -sd,); local to=3h; [[ -n $nodes ]] && to=1h
-    [[ -n $nodes ]] || nodes=$($G status --json | python3 -c "import json,sys;b='$bad'.split();print(','.join(n for n in json.load(sys.stdin)['free'] if n not in b))")
+    nodes=$(for n in $PREF; do [[ " $bad " == *" $n "* ]] || echo $n; done | paste -sd,); local to=3h
     [[ -n $nodes ]] || { why="no pool node left outside ${bad}"; exit 1; }
     log "START acquiring a whole node (attempt $tries, nodes $nodes)"
     local arc stale=0
     while :; do  # an NFS "Stale file handle" (errno 116) in gpool is transient: retry it, at most 5 times
-      out=$($G acquire -g 8 --node "$nodes" -p "MengqingCao/ATOM#81 spike: M3.1 1P1D A/B1/B2 aiperf shared 128k prefix + unique tail, prefix caching on, OSL 2k, c45/c64 x2, prefill 2 TB Mooncake CPU KV tier (~5h)" --wait --timeout $to 2>&1); arc=$?
+      out=$($G acquire -g 8 --node "$nodes" -p "MengqingCao/ATOM#81 spike: M3.1 1P1D A/B1/B2 aiperf shared 128k prefix + unique tail, prefix caching on, OSL 2k, B2-c64-r1 + B2-c45-r1b, prefill 2 TB Mooncake CPU KV tier (~30 min)" --wait --timeout $to 2>&1); arc=$?
       ((arc == 0)) && break
       echo "$out"
-      [[ $arc == 2 && -n $PREF ]] && { log "no grant on preferred $nodes in $to: any free node next"; PREF=; tries=$((tries - 1)); continue 2; }
       grep -qiE 'stale file handle|errno 116' <<<"$out" && ((++stale <= 5)) || { why="acquire rc=$arc (timed out or refused)"; exit 1; }
       log "acquire hit a stale NFS file handle (rc=$arc): retry $stale/5 in 60 s"; sleep 60
     done
@@ -87,6 +86,7 @@ drop() {
   $G release "$LEASE" --force --note "#81 driver: GPUs busy with a foreign unleased process ($1), nothing of ours ran; re-queuing elsewhere"
   : > $S/driver_lease; log "END released $LEASE on $NODE: foreign process"; bad="$bad $NODE"; LEASE=
 }
+rm -f $S/driver_stop  # batch.sh's stop hook, armed to stop the previous driver at a run boundary
 log "CONFIG #81: #35 setup (NVFP4 KV + NVFP4 index on P and D, DSpark draft KV fp8, 2 TB Mooncake Store prefill tier, decode DP session affinity off, forced AL 4.04) with aiperf: one shared 130048-token prefix (pool size 1) + a unique 1024-token tail a request (128k context), OSL 2048 (stddev 0, ignore_eos), prefix caching ON on P and D (owner's ruling 7184230573); 1 warmup request at concurrency 1 computes the prefix once, then 5 x CONC measured requests; watchdog 75 min to aiperf start, then duration+${WD_MARGIN:-1800} s"
 grant
 
@@ -145,8 +145,7 @@ run() {
   [[ $valid == yes ]]
 }
 
-# No smoke gate (owner's ruling 7185214449): B2-c45-r1 (run 20261126062333) is done and valid; run the rest of the matrix.
-for r in 1 2; do for c in 45 64; do for a in A B1 B2; do
-  [[ $a$c$r == B2451 ]] && continue
-  run "$a-c$c-r$r $a fixed $c 1200" || { why="$a-c$c-r$r invalid: diagnose"; exit 1; }
-done; done; done
+# Owner's ruling 7188551385: r2 dropped; A-c45/B1-c45/A-c64/B1-c64 r1 done on g53 (B1-c64-r1 by the previous driver).
+for spec in "B2-c64-r1 B2 fixed 64 1200" "B2-c45-r1b B2 fixed 45 1200"; do
+  run "$spec" || { why="${spec%% *} invalid: diagnose"; exit 1; }
+done

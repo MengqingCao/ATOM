@@ -5,6 +5,8 @@
 # profiler window once 20,000 draft tokens are in (the launcher opens windows only in AgentX runs).
 S=/share_nfs/mengqing/code/tmp/m31-decode-dep4/81; D=$(dirname "$(readlink -f "$0")")
 mkdir -p $S/acc $S/logs
+# Stop hook for driver.sh hand-over: with $S/driver_stop present, start nothing (the spec is noted in it).
+[[ -e $S/driver_stop ]] && { echo "$*" >> $S/driver_stop; echo "driver_stop present: no run started"; exit 3; }
 for spec; do
   tr=; [[ "$spec" == TRACE=1:* ]] && { tr=1; spec=${spec#TRACE=1:}; }
   set -- $spec; tag=$1 kind=$3; pids=()

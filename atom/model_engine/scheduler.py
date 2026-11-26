@@ -35,7 +35,10 @@ import numpy as np
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
-from atom.kv_transfer.disaggregation.types import produced_no_handoff
+from atom.kv_transfer.disaggregation.types import (
+    CHUNKED_ADMISSION_TIMEOUT,
+    produced_no_handoff,
+)
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import (
     AdmissionProbe,
@@ -2602,6 +2605,14 @@ class Scheduler:
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
             self._finish_rejected_waiting(self.waiting.popleft())
+        if self.kv_connector is not None:
+            # A ready head blocked on room keeps its place past the admission
+            # deadline; an expired request behind it is answered now.
+            for seq in [
+                s for s in self.waiting if s.leave_reason == CHUNKED_ADMISSION_TIMEOUT
+            ]:
+                self.waiting.remove(seq)
+                self._finish_rejected_waiting(seq)
         if self.enable_mixed_prefill_decode:
             limits = self._promote_mixed_remote_decodes(limits)
             self.block_manager.reserved_decode_blocks = limits.reserved_decode_blocks
@@ -3732,11 +3743,15 @@ class Scheduler:
         seq.prefill_completed = True
         tracing.prefill_complete(seq)
 
-    def _finish_rejected_waiting(self, seq: Sequence, reason: str = "aborted") -> None:
+    def _finish_rejected_waiting(
+        self, seq: Sequence, reason: str | None = None
+    ) -> None:
         """Finish an aborted or unschedulable waiting request.
 
         A preempted request may already have run before this rejection.
+        With no `reason`, a reason the connector already set is kept.
         """
+        reason = reason or seq.leave_reason or "aborted"
         self._early_load.note_gone(seq.id, aborted=True)
         if self.pd_admission is not None:
             self.pd_admission.cancel(seq)
@@ -3767,7 +3782,7 @@ class Scheduler:
         seq._awaiting_aborted_load_cleanup = True
 
     def _finish_rejected_waiting_cancelling(
-        self, seq: Sequence, reason: str = "aborted"
+        self, seq: Sequence, reason: str | None = None
     ) -> None:
         """`_finish_rejected_waiting` behind a connector that cancels undispatched loads.
 

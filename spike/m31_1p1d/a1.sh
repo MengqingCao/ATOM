@@ -4,7 +4,9 @@
 # over them, at #33's points plus POINTS_EXTRA (JSON {name: [requests per rank]}, B2's measured rows).
 # Run from the dev host holding the node's lease; uses GPUs 0-3 pinned by UUID.  Usage: a1.sh NODE OUT_TAG [PORT]
 set -euo pipefail
-NODE=$1; TAG=$2; PORT=${3:-29571}; HOST=pit2-p03-$NODE; C=mengqing-dep4-35-a1
+NODE=$1; TAG=$2; HOST=pit2-p03-$NODE; C=mengqing-dep4-35-a1
+# torchrun master port: a free one on the node (a fixed one can be held by another process there)
+PORT=${3:-$(ssh $HOST "python3 -c 'import socket;s=socket.socket();s.bind((\"\",0));print(s.getsockname()[1])'")}
 S=/share_nfs/mengqing/code/tmp/m31-decode-dep4/35/a1; IMAGE=rocm/atom-dev:nightly_202611240650
 U=$(ssh $HOST rocm-smi --showuniqueid | awk '/Unique ID/ {match($0,/GPU\[[0-9]+\]/); i=substr($0,RSTART+4,RLENGTH-5); if (i<4) {u=$0; sub(/.*0x/,"",u); o=o (o?",":"") "GPU-" u}} END{print o}')
 ssh $HOST "docker rm -f $C >/dev/null 2>&1; docker run -d --init --name $C --network host --ipc host --device /dev/kfd --device /dev/dri \

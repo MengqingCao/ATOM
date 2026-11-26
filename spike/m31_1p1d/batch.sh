@@ -8,9 +8,19 @@ mkdir -p $S/acc $S/logs
 for spec; do
   tr=; [[ "$spec" == TRACE=1:* ]] && { tr=1; spec=${spec#TRACE=1:}; }
   set -- $spec; tag=$1 kind=$3; pids=()
+  # The first shift (0, 100, ... 1800) whose launcher ports, default base + 0..31 and the eval phase's +1000 twin,
+  # no TCP socket on the node uses (stays below the 32768+ ephemeral range); run_pd.sh / ov_spike.sh apply it.
+  export ATOMESH_PORT_SHIFT=$(ss -Htan | python3 -c '
+import sys
+used = {int(l.split()[3].rsplit(":", 1)[1]) for l in sys.stdin if l.strip()}
+bases = (8000, 8010, 8020, 6301, 29100, 29500, 29600, 29700, 29800, 26051, 26080, 26090)
+print(next((s for s in range(0, 1801, 100)
+            if not any(b + s + e + k in used for b in bases for e in (0, 1000) for k in range(32))), ""))')
+  [[ -n $ATOMESH_PORT_SHIFT ]] || { echo "$(date -u +%T) $tag rc=2 no free launcher port block"; continue; }
+  mp=$((9020 + ATOMESH_PORT_SHIFT))  # poll_mtp.sh / gsm_profile.sh: the eval-phase decode port
   if [[ $kind == gsm8k ]]; then
-    bash $D/poll_mtp.sh $S/acc/mtp_$tag.json & pids+=($!)
-    [[ -n $tr ]] && { bash $D/gsm_profile.sh & pids+=($!); }
+    PORT=$mp bash $D/poll_mtp.sh $S/acc/mtp_$tag.json & pids+=($!)
+    [[ -n $tr ]] && { PORT=$mp bash $D/gsm_profile.sh & pids+=($!); }
   fi
   TRACE=$tr EVAL_LIMIT=200 bash $D/run_1p1d.sh "$@" > $S/logs/$tag.log 2>&1
   echo "$(date -u +%T) $tag rc=$?"

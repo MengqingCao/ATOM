@@ -27,3 +27,18 @@ export AIPERF_WARMUP_REQUESTS_PER_LANE=1
 # (2 TiB = 1024 GiB a node failed rc=134 on g48 and g40).
 export ATOMESH_PREFILL_ENV_MOONCAKE_STORE=1
 export ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS="0:465:rdma4;0:465:rdma5;1:465:rdma6;1:465:rdma7"
+# Ports: another process on the node can hold a launcher default (29600 on g53, run 20261126035137). batch.sh picks
+# ATOMESH_PORT_SHIFT so every default port (and its eval-phase +1000 twin) is free; the launcher shifts all of them
+# (servers, router, Prometheus, handshake, P and D torch dist master/base, Mooncake master/metadata/metrics/owners)
+# through ATOMESH_SERVICE_PORT_OFFSET, so P and D stay wired to each other.
+python3 - .github/scripts/atomesh/pd_slurm_job.sh <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+for a, b in (("printf '%s\\n' \"${ATOMESH_RESTART_PORT_OFFSET}\"",
+              "printf '%s\\n' \"$((ATOMESH_RESTART_PORT_OFFSET + ${ATOMESH_PORT_SHIFT:-0}))\"  # ATOM#35"),
+             ("printf '0\\n'", "printf '%s\\n' \"${ATOMESH_PORT_SHIFT:-0}\"  # ATOM#35")):
+    assert s.count(a) == 1, "execution_phase_port_offset in pd_slurm_job.sh changed"
+    s = s.replace(a, b)
+open(p, "w").write(s)
+PY

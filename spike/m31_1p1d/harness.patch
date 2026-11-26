@@ -1,5 +1,5 @@
 --- a/bin/run_pd.sh	2026-11-25 03:39:18.102945859 +0000
-+++ b/bin/run_pd.sh	2026-11-25 07:54:23.026199264 +0000
++++ b/bin/run_pd.sh	2026-11-26 03:59:56.093149354 +0000
 @@ -31,8 +31,9 @@
  BASE="${H}/runs"
  SNAP="${H}/src/${TAG}-${STAMP}"
@@ -12,6 +12,23 @@
  git -C "${TREE}" worktree add --detach "${SNAP}" "${snap_sha}" > /dev/null
  echo "snapshot ${snap_sha} of ${TREE} -> ${SNAP}"
  cd "${SNAP}"
+@@ -141,12 +142,12 @@
+ fi
+ { echo "tag=${TAG} decode_arm=${ARM} prefill_arm=${PREFILL_ARM} kind=${KIND} conc=${CONC} duration=${DUR} cell=${CELL}"
+   echo "decode: ${DEC_ARGS} ${DEC_ENV} | prefill: ${PF_ARGS} ${PF_ENV} mnbt=${PF_MNBT}"
+-  echo "node=$(hostname) image=${IMAGE} tree=${TREE} snapshot=${snap_sha} job=${SPUR_JOB_ID}"; } | tee "${LOG_ROOT}/run.txt"
++  echo "node=$(hostname) image=${IMAGE} tree=${TREE} snapshot=${snap_sha} job=${SPUR_JOB_ID} port_shift=${ATOMESH_PORT_SHIFT:-0}"; } | tee "${LOG_ROOT}/run.txt"
+ git -C "${TREE}" diff "$(git -C "${TREE}" rev-parse HEAD)" "${snap_sha}" > "${LOG_ROOT}/source.diff" || true
+-# Decode and prefill /metrics every 2 s (pd_report.py: step time vs batch, prefill side).
+-python3 "${H}/bin/pd_scrape.py" --url http://127.0.0.1:8020 --out "${LOG_ROOT}/scrape_decode.jsonl" --interval 2 &
++# Decode and prefill /metrics every 2 s, on the ports shifted by ATOMESH_PORT_SHIFT (batch.sh) (pd_report.py: step time vs batch, prefill side).
++python3 "${H}/bin/pd_scrape.py" --url "http://127.0.0.1:$((DECODE_PORT + ${ATOMESH_PORT_SHIFT:-0}))" --out "${LOG_ROOT}/scrape_decode.jsonl" --interval 2 &
+ SCRAPE_D=$!
+-python3 "${H}/bin/pd_scrape.py" --url http://127.0.0.1:8010 --out "${LOG_ROOT}/scrape_prefill.jsonl" --interval 2 &
++python3 "${H}/bin/pd_scrape.py" --url "http://127.0.0.1:$((PREFILL_PORT + ${ATOMESH_PORT_SHIFT:-0}))" --out "${LOG_ROOT}/scrape_prefill.jsonl" --interval 2 &
+ SCRAPE_P=$!
+ set +e
+ bash .github/scripts/atomesh/pd_slurm_job.sh --spur-worker
 --- a/bin/layer_breakdown.py	2026-11-25 03:39:17.560248315 +0000
 +++ b/bin/layer_breakdown.py	2026-11-25 07:58:23.640208444 +0000
 @@ -25,6 +25,8 @@

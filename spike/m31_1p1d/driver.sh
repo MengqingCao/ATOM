@@ -44,20 +44,23 @@ foreign() {
     else u=$(ps -o uid= -p $p | tr -d " "); [ -n "$u" ] && [ "$u" != "$(id -u)" ] && echo "pid $p uid $u"; fi
   done' | sort -u | grep -vE "^container (mengqing-dep4-35-|atomesh-.*-(${jobs:-NONE})-[0-9]+)"
 }
-bad=; tries=0; MAXTRIES=8  # most cache-heavy nodes fail the MemFree check below
+bad=; tries=0; MAXTRIES=8; PREF=${PREF:-g27 g53}  # most cache-heavy nodes fail the MemFree check below
 # Take a whole node (never one in $bad), get the image on it, and check no one else is on its GPUs.
 grant() {
   local nodes out who
   while :; do
     tries=$((tries + 1)); ((tries > MAXTRIES)) && { why="no clean node after $MAXTRIES grants (busy: ${bad:-none})"; exit 1; }
-    nodes=$($G status --json | python3 -c "import json,sys;b='$bad'.split();print(','.join(n for n in json.load(sys.stdin)['free'] if n not in b))")
+    # g27 and g53 pass the per-NUMA MemFree check below: ask for them (queueing) first, any free node after that.
+    nodes=$(for n in $PREF; do [[ " $bad " == *" $n "* ]] || echo $n; done | paste -sd,); local to=3h; [[ -n $nodes ]] && to=1h
+    [[ -n $nodes ]] || nodes=$($G status --json | python3 -c "import json,sys;b='$bad'.split();print(','.join(n for n in json.load(sys.stdin)['free'] if n not in b))")
     [[ -n $nodes ]] || { why="no pool node left outside ${bad}"; exit 1; }
     log "START acquiring a whole node (attempt $tries, nodes $nodes)"
     local arc stale=0
     while :; do  # an NFS "Stale file handle" (errno 116) in gpool is transient: retry it, at most 5 times
-      out=$($G acquire -g 8 --node "$nodes" -p "MengqingCao/ATOM#35 spike: M3.1 1P1D A/B1/B2 AgentX c140/c150 + GSM8K-200 + A1 rerun, prefill 2 TB Mooncake CPU KV tier (~10h)" --wait --timeout 3h 2>&1); arc=$?
+      out=$($G acquire -g 8 --node "$nodes" -p "MengqingCao/ATOM#35 spike: M3.1 1P1D A/B1/B2 AgentX c140/c150 + GSM8K-200 + A1 rerun, prefill 2 TB Mooncake CPU KV tier (~10h)" --wait --timeout $to 2>&1); arc=$?
       ((arc == 0)) && break
       echo "$out"
+      [[ $arc == 2 && -n $PREF ]] && { log "no grant on preferred $nodes in $to: any free node next"; PREF=; tries=$((tries - 1)); continue 2; }
       grep -qiE 'stale file handle|errno 116' <<<"$out" && ((++stale <= 5)) || { why="acquire rc=$arc (timed out or refused)"; exit 1; }
       log "acquire hit a stale NFS file handle (rc=$arc): retry $stale/5 in 60 s"; sleep 60
     done
@@ -101,10 +104,14 @@ run() {
   who=$(foreign | paste -sd';')
   [[ -n $who ]] && { log "RUN $tag skipped: gpus busy by foreign process: $who"; drop "$who"; grant; run "$spec"; return; }
   t0=$(date -u +%FT%TZ)
+  # This run's dir is the one pd-$tag-* that was not there before it (the newest may be an earlier run's: 20261126035137).
+  local before; before=$(ls -d $R/pd-$tag-* 2>/dev/null)
+  newdir() { comm -13 <(sort <<<"$before") <(ls -d $R/pd-$tag-* 2>/dev/null | sort) | tail -1; }
+  dir=
   ssh "$HOST" "bash $D/batch.sh '$spec'" &
   local p=$!
   for _ in $(seq 60); do  # learn the launcher job id so clean() can stop it if we are killed
-    sleep 10; dir=$(ls -dt $R/pd-$tag-* 2>/dev/null | head -1)
+    sleep 10; dir=$(newdir)
     [[ -n $dir && -f $dir/run.txt ]] && { JOB=$(grep -o 'job=[0-9]*' "$dir/run.txt" | cut -d= -f2); break; }
   done
   while kill -0 $p 2>/dev/null; do
@@ -112,7 +119,8 @@ run() {
     sleep 30
   done
   wait $p; t1=$(date -u +%FT%TZ)
-  dir=$(ls -dt $R/pd-$tag-* 2>/dev/null | head -1); rc=$(cat "$dir/local-rc" 2>/dev/null | cut -d= -f2)
+  dir=$(newdir); rc=; [[ -n $dir ]] && rc=$(cut -d= -f2 "$dir/local-rc" 2>/dev/null)
+  [[ -z $JOB && -f $dir/run.txt ]] && JOB=$(grep -o 'job=[0-9]*' "$dir/run.txt" | cut -d= -f2)
   if [[ $spec == TRACE=1:* ]]; then  # a traced run gives the trace only
     [[ -n $(find "$dir" -path '*torch_traces*' -type f 2>/dev/null | head -1) ]] && valid=yes || valid=no
   elif [[ $kind == agentx ]]; then

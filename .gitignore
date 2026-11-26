@@ -67,3 +67,4 @@ unit-report.xml
 # Example tokenizers are downloaded on demand by ensure_tokenizer.sh. In
 # particular, the gated Llama tokenizers must not be redistributed here.
 atomrl/lumen/examples/*/tokenizer/
+.claude/agent-team.local.md

@@ -297,7 +297,8 @@ life of the process, so a busy owner never causes a later turn to lose its
 prefix-cache locality. Child correlation IDs are independent sessions and do
 not inherit the parent's rank. For an established session, load accounting
 charges only positive prompt-length growth rather than repeatedly charging the
-complete cached conversation.
+complete cached conversation. An opt-in least-session placement of new
+sessions is designed in [dp_least_session.md](dp_least_session.md).
 
 The OpenAI server reads the session ID from `X-Dynamo-Session-ID`, falling back
 to `X-Correlation-ID`; `X-Dynamo-Parent-Session-ID` is retained for routing

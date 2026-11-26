@@ -42,15 +42,16 @@ for a, b in (("printf '%s\\n' \"${ATOMESH_RESTART_PORT_OFFSET}\"",
     s = s.replace(a, b)
 open(p, "w").write(s)
 PY
-# ATOM#81 fixed-length cell (run_pd.sh KIND=fixed, the AgentX cell's P/D topology): plain aiperf synthetic prompts,
-# ISL FIXED_ISL (131072) / OSL FIXED_OSL (2048), both stddev 0, ignore_eos; one unique prompt a request
-# (dataset entries = warmup + measured requests); prefix caching off on P and D. Closed loop at CONC: CONC warmup
-# requests, then CONC x FIXED_REQ_MULT (5) measured ones; pd_report.py's window ends at "sending complete".
+# ATOM#81 fixed-length cell (run_pd.sh KIND=fixed, the AgentX cell's P/D topology), owner's ruling 7184230573:
+# every request = one shared FIXED_PREFIX (130048) token prefix + a unique FIXED_TAIL (1024) token synthetic tail
+# (128k context), OSL FIXED_OSL (2048), stddev 0, ignore_eos; prefix caching ON on P and D (the cell's default).
+# aiperf --prefix-prompt-pool-size 1 gives every request the same prefix; dataset entries = 1 + measured requests,
+# so each tail is unique. Warmup: 1 request at concurrency 1 computes the prefix once (aiperf waits for it before the
+# profiling phase); then a closed loop at CONC with CONC x FIXED_REQ_MULT (5) measured requests.
 if [[ "${KIND}" == fixed ]]; then
-  export ENABLE_PREFIX_CACHING=false
-  python3 - .github/scripts/atomesh/pd_server_atom.sh "${FIXED_ISL:-131072}" "${FIXED_OSL:-2048}" "${FIXED_REQ_MULT:-5}" <<'PY'
+  python3 - .github/scripts/atomesh/pd_server_atom.sh "${FIXED_PREFIX:-130048}" "${FIXED_TAIL:-1024}" "${FIXED_OSL:-2048}" "${FIXED_REQ_MULT:-5}" <<'PY'
 import sys
-p, isl, osl, mult = sys.argv[1:]
+p, pre, isl, osl, mult = sys.argv[1:]
 s = open(p).read()
 a = '      "${AGENTX_VENV}/bin/agentx" profile \\\n'
 b = '      --public-dataset "${AIPERF_PUBLIC_DATASET}" \\\n'
@@ -62,8 +63,9 @@ n = f"$(( conc * {mult} ))"
 new = ('      "${AGENTX_VENV}/bin/aiperf" profile \\\n'
        '      --url "http://127.0.0.1:${ROUTER_PORT}" --endpoint /v1/chat/completions --endpoint-type chat --streaming \\\n'
        '      --model "${MODEL_PATH}" --tokenizer "${MODEL_PATH}" --tokenizer-trust-remote-code \\\n'
-       f'      --concurrency "${{conc}}" --warmup-request-count "${{conc}}" --request-count "{n}" \\\n'
-       f'      --num-dataset-entries "$(( conc + {n} ))" --random-seed 42 \\\n'
+       f'      --concurrency "${{conc}}" --warmup-request-count 1 --warmup-concurrency 1 --request-count "{n}" \\\n'
+       f'      --num-dataset-entries "$(( 1 + {n} ))" --random-seed 42 \\\n'
+       f'      --prefix-prompt-pool-size 1 --prefix-prompt-length {pre} \\\n'
        f'      --isl {isl} --isl-stddev 0 --osl {osl} --osl-stddev 0 --extra-inputs ignore_eos:true \\\n'
        '      --use-server-token-count --no-gpu-telemetry --stats-interval 30 \\\n'
        '      --failed-request-threshold "${AIPERF_FAILED_REQUEST_THRESHOLD}" --slice-duration "${AIPERF_SLICE_DURATION}" \\\n'

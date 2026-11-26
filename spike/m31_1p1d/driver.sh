@@ -2,7 +2,7 @@
 # Unattended #81 queue on ONE whole node, run detached on the dev host:
 #   setsid nohup bash driver.sh > $S/driver.log 2>&1 < /dev/null &
 # acquire (-g 8 --wait) -> smoke B2-c45-r1 (gate: decode batch >= 0.8 x 45, else stop for a ruling) -> A/B1/B2 x c45/c64 x r1,r2,
-# all KIND=fixed (aiperf synthetic ISL 128k / OSL 2k, ov_spike.sh). One line a run in $S/driver_status.txt. Stops on the first
+# all KIND=fixed (aiperf: one shared 127k prefix + unique 1k tail = 128k context, OSL 2k, prefix caching on; ov_spike.sh). One line a run in $S/driver_status.txt. Stops on the first
 # run without client data (a run past 1200 + WD_MARGIN s is stopped by the watchdog and counts as invalid), or on YIELD;
 # always cleans its own containers and releases the lease (trap). A node whose GPUs a foreign (unleased) process
 # uses is released with --force and skipped; the queue re-acquires elsewhere, at most MAXTRIES grants in all.
@@ -56,7 +56,7 @@ grant() {
     log "START acquiring a whole node (attempt $tries, nodes $nodes)"
     local arc stale=0
     while :; do  # an NFS "Stale file handle" (errno 116) in gpool is transient: retry it, at most 5 times
-      out=$($G acquire -g 8 --node "$nodes" -p "MengqingCao/ATOM#81 spike: M3.1 1P1D A/B1/B2 aiperf fixed ISL 128k/OSL 2k c45/c64 x2, prefill 2 TB Mooncake CPU KV tier (~5h)" --wait --timeout $to 2>&1); arc=$?
+      out=$($G acquire -g 8 --node "$nodes" -p "MengqingCao/ATOM#81 spike: M3.1 1P1D A/B1/B2 aiperf shared 128k prefix + unique tail, prefix caching on, OSL 2k, c45/c64 x2, prefill 2 TB Mooncake CPU KV tier (~5h)" --wait --timeout $to 2>&1); arc=$?
       ((arc == 0)) && break
       echo "$out"
       [[ $arc == 2 && -n $PREF ]] && { log "no grant on preferred $nodes in $to: any free node next"; PREF=; tries=$((tries - 1)); continue 2; }
@@ -87,7 +87,7 @@ drop() {
   $G release "$LEASE" --force --note "#81 driver: GPUs busy with a foreign unleased process ($1), nothing of ours ran; re-queuing elsewhere"
   : > $S/driver_lease; log "END released $LEASE on $NODE: foreign process"; bad="$bad $NODE"; LEASE=
 }
-log "CONFIG #81: #35 setup (NVFP4 KV + NVFP4 index on P and D, DSpark draft KV fp8, 2 TB Mooncake Store prefill tier, decode DP session affinity off, forced AL 4.04) with aiperf synthetic ISL 131072 / OSL 2048 (stddev 0, ignore_eos, unique prompt a request, prefix caching off on P and D), CONC warmup + 5 x CONC measured requests; watchdog duration+${WD_MARGIN:-1800} s"
+log "CONFIG #81: #35 setup (NVFP4 KV + NVFP4 index on P and D, DSpark draft KV fp8, 2 TB Mooncake Store prefill tier, decode DP session affinity off, forced AL 4.04) with aiperf: one shared 130048-token prefix (pool size 1) + a unique 1024-token tail a request (128k context), OSL 2048 (stddev 0, ignore_eos), prefix caching ON on P and D (owner's ruling 7184230573); 1 warmup request at concurrency 1 computes the prefix once, then 5 x CONC measured requests; watchdog duration+${WD_MARGIN:-1800} s"
 grant
 
 yield() { $G mine | grep "$LEASE" | grep -q YIELD; }
@@ -136,13 +136,16 @@ run() {
   fi
   done_n=$((done_n + 1))
   log "RUN $tag rc=${rc:-?}$late valid=$valid start=$t0 end=$t1 dir=${dir:-none}"
+  [[ $kind == fixed && -n $dir ]] && log "PREFIX $tag $(python3 $D/prefix_stats.py "$dir" 2>&1 | tail -1)"
   [[ $valid == yes ]]
 }
 
-# Smoke = B2-c45-r1, kept as the matrix's first run when it passes. With 128k unique prompts one PP4 prefill may not feed
-# 45 decode rows: below 0.8 x CONC decode running batch (window mean) the point is prefill-bound, so stop for a ruling on #81.
+# Smoke = B2-c45-r1, kept as the matrix's first run when it passes. Gate: prefix caching on (P and D engine kwargs) and the
+# decode running batch (window mean) >= 0.8 x CONC; below it the shared prefix did not make prefill cheap enough: ruling on #81.
 run 'B2-c45-r1 B2 fixed 45 1200' || { why="smoke B2-c45-r1 invalid: diagnose"; exit 1; }
-grep -rqs -- '--no-enable_prefix_caching' "$dir"/slurm_job-*/logs || { why="smoke B2-c45-r1: prefix caching not off: diagnose"; exit 1; }
+for s in prefill decode; do
+  grep -qs "'enable_prefix_caching': True" "$dir"/slurm_job-*/logs/$s-rank-0.log || { why="smoke B2-c45-r1: prefix caching not on ($s): diagnose"; exit 1; }
+done
 sm=$(python3 -c "import json;d=json.load(open('$dir/report.json'));e=d['decode'];print(e.get('batch_mean_all', e.get('batch_mean')), e.get('batch_mean'), e.get('batch_p90'), d['prefill'].get('computed_tok_s'), d['client'].get('req_s'), d['client'].get('out_tok_s_per_gpu'))" 2>/dev/null)
 log "SMOKE decode batch mean(all) mean(busy) p90, prefill computed tok/s, req/s, out tok/s/GPU = ${sm:-none} (CONC 45)"
 python3 -c "import sys;sys.exit(not float('${sm%% *}') >= 0.8 * 45)" 2>/dev/null \

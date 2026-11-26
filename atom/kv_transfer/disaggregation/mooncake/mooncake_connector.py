@@ -91,6 +91,7 @@ from atom.kv_transfer.disaggregation.transfer_plan import (
     page_transfer_plan,
 )
 from atom.kv_transfer.disaggregation.types import (
+    CHUNKED_ADMISSION_TIMEOUT,
     INDEX_CACHE_FP4_PREFIX,
     INDEX_CACHE_ROLE,
     MLA_KV_ROLE,
@@ -927,14 +928,15 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def _expire_chunked_admission(
         self, seq: Sequence, deadline: float, now: float
     ) -> bool:
-        if now < deadline:
+        # Decode admitted it: only P capacity is missing, so the clock stops.
+        if now < deadline or seq.id in self._chunked_ready:
             return False
         logger.warning(
-            "Chunked P/D admission timed out for request %s before source allocation",
+            "Chunked P/D admission timed out for request %s before decode admitted it",
             seq.id,
         )
         seq.status = SequenceStatus.ABORTED
-        seq.leave_reason = "aborted"
+        seq.leave_reason = CHUNKED_ADMISSION_TIMEOUT
         self.request_finished(seq)
         self._pending_chunked_admissions.pop(seq.id, None)
         return True

@@ -23,6 +23,7 @@ from atom.kv_transfer.disaggregation.chunked_prefill import (
 from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
+    CHUNKED_ADMISSION_TIMEOUT,
     ConnectorCompletion,
     ConnectorMetadata,
     KVConnectorOutput,
@@ -2016,7 +2017,7 @@ def test_admission_timeout_without_decode_retires_all_stages(
     assert not p.kv_connector._chunked_waiting and not p.kv_connector._chunked_ready
     _, scheduled = p.schedule()
     assert not scheduled and not p.waiting and not seq.block_table
-    assert seq.leave_reason == "aborted"
+    assert seq.leave_reason == CHUNKED_ADMISSION_TIMEOUT
 
 
 @pytest.mark.parametrize("pp_size", [1, 3])
@@ -2081,6 +2082,7 @@ def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
     _, scheduled = p.schedule()
     assert not scheduled and all(not seq.block_table for seq in ps)
     now[0] = 110.0
+    assert p.abort_request(ps[0].id)  # A ready request no longer expires.
     cancellation = p.kv_connector.build_connector_meta()
     assert set(cancellation.reqs_to_save) == {seq.id for seq in ps}
     if cancel_decode:
@@ -2296,3 +2298,145 @@ def test_a_withdrawn_producer_admission_dispatches_no_source_blocks(
     assert set(meta.reqs_to_save) == {first.id}
     assert str(withdrawn.id) not in producer._awaiting_send
     assert not withdrawn.block_table
+
+
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/completions"])
+@pytest.mark.parametrize("timed_out", [True, False])
+def test_admission_timeout_answers_424(monkeypatch, seq_factory, path, timed_out):
+    from conftest import MockConfig
+    from fastapi.testclient import TestClient
+
+    from atom.entrypoints.openai import api_server
+    from atom.model_engine.engine_core_mgr import CoreManager
+    from atom.model_engine.scheduler import Scheduler
+
+    now = [100.0]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
+    p = Scheduler(MockConfig())
+    p.kv_connector = scheduler_connector(monkeypatch, True, admission_timeout_s=10)
+    seq = pd_sequence(seq_factory)
+    core = SimpleNamespace(
+        _seq_id_to_callback={}, label="P", _release_constraints=lambda _seqs: None
+    )
+
+    def preprocess(_prompt, _sampling, stream_callback=None, **_kwargs):
+        core._seq_id_to_callback[seq.id] = stream_callback
+        return seq
+
+    def add_request(seqs):
+        # The real producer scheduler ends the request; its rejection is
+        # delivered to the client as the engine core delivers it.
+        p.extend(seqs)
+        p.schedule()
+        if timed_out:
+            now[0] = 110.0
+        else:
+            assert p.abort_request(seq.id)
+        p.schedule()
+        p.schedule()
+        (rejected,) = p.take_rejected()
+        assert CoreManager._deliver_terminal_output(core, rejected)
+
+    monkeypatch.setattr(
+        api_server,
+        "engine",
+        SimpleNamespace(
+            io_processor=SimpleNamespace(preprocess=preprocess, requests={}),
+            core_mgr=SimpleNamespace(add_request=add_request),
+        ),
+    )
+    monkeypatch.setattr(api_server, "model_name", "m")
+    monkeypatch.setattr(api_server, "_request_logger", None)
+    monkeypatch.setattr(api_server, "default_chat_template_kwargs", {})
+    monkeypatch.setattr(api_server, "reasoning_toggle", None)
+    monkeypatch.setattr(api_server, "custom_message_encoder", None)
+    monkeypatch.setattr(api_server, "tool_call_parser_cls", None)
+    monkeypatch.setattr(
+        api_server, "tokenizer", SimpleNamespace(decode=lambda _ids, **_kw: "")
+    )
+    monkeypatch.setattr(api_server, "apply_chat_template", lambda *_a, **_kw: "hi")
+    client = TestClient(api_server.app, raise_server_exceptions=False)
+    body = {"model": "m", "kv_transfer_params": seq.kv_transfer_params}
+    if path == "/v1/chat/completions":
+        body["messages"] = [{"role": "user", "content": "hi"}]
+    else:
+        body["prompt"] = "hi"
+    reply = client.post(path, json=body)
+    if timed_out:
+        assert reply.status_code == 424
+        error = reply.json()["error"]
+        assert error["code"] == 424 and "admission timed out" in error["message"]
+    else:
+        assert reply.status_code == 200
+        # A plain abort keeps its empty success.
+        assert reply.json()["choices"][0]["finish_reason"] == "stop"
+    assert not api_server.engine.io_processor.requests
+    # A streaming chunked prefill leg is refused before anything is enqueued.
+    reply = client.post(path, json=dict(body, stream=True))
+    assert reply.status_code == 400
+    assert "must not stream" in reply.json()["error"]["message"]
+
+
+def test_decode_abort_drops_an_unadmitted_chunked_request(monkeypatch, seq_factory):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+
+    d = Scheduler(MockConfig(num_kvcache_blocks=3))
+    d.kv_connector = scheduler_connector(monkeypatch, False)
+    occupied = seq_factory(list(range(10)))
+    assert d.block_manager.allocate(occupied)
+    ds = pd_sequence(seq_factory, producer=False)
+    d.add(ds)
+    dw = decode_worker((ctypes.c_ubyte * 48)())
+    batch, scheduled = d.schedule()
+    assert not scheduled and not ds.block_table
+    dw.start_load_kv(batch.connector_meta_output)
+    # The router dropped the leg: decode's disconnect path aborts it.
+    assert d.abort_request(ds.id)
+    assert ds not in d.waiting and not ds.block_table
+    assert ds.leave_reason == "aborted"
+    dw.start_load_kv(d.kv_connector.build_connector_meta())
+    assert not dw._pending_recv and not dw._pending_recv_expected
+    d.block_manager.deallocate(occupied)
+    batch, scheduled = d.schedule()
+    assert not scheduled and not batch.connector_meta_output.has_work()
+    dw.start_load_kv(batch.connector_meta_output)
+    assert not dw._pending_recv and d.block_manager.kv.num_free == 3
+    dw._send_on_socket.assert_not_called()
+
+
+def test_ready_request_outlives_the_admission_deadline(monkeypatch, seq_factory):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+    from atom.model_engine.sequence import SequenceStatus
+
+    now = [100.0]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
+    p = Scheduler(MockConfig(num_kvcache_blocks=3))
+    p.kv_connector = scheduler_connector(monkeypatch, True, admission_timeout_s=10)
+    occupied = seq_factory(list(range(10)))
+    assert p.block_manager.allocate(occupied)
+    ready, unready = (pd_sequence(seq_factory, f"wait-{i}") for i in range(2))
+    p.extend([ready, unready])
+    worker, request, _src, _dst = idle_producer()
+    batch, scheduled = p.schedule()
+    worker.start_load_kv(batch.connector_meta_output)
+    dispatch(worker, dict(request, transfer_id="wait-0"))
+    p._update_from_kv_xfer_finished(worker.get_finished())
+    assert p.kv_connector.admission_ready(ready)
+    now[0] = 200.0  # Well past the deadline, still capacity-blocked.
+    for _ in range(2):
+        batch, scheduled = p.schedule()
+        assert not scheduled
+        worker.start_load_kv(batch.connector_meta_output)
+    assert ready.status == SequenceStatus.WAITING and not ready.block_table
+    assert unready.leave_reason == CHUNKED_ADMISSION_TIMEOUT
+    assert p.take_rejected() == [unready]
+    p.block_manager.deallocate(occupied)
+    batch, scheduled = p.schedule()
+    assert list(scheduled) == [ready.id] and ready.block_table
+    worker.start_load_kv(batch.connector_meta_output)
+    assert "wait-0" in worker._chunked_prefills
+    assert not ready.kv_transfer_params.get("prefill_aborted")

@@ -51,6 +51,7 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     DEFAULT_HANDSHAKE_PORT,
     producer_endpoint,
 )
+from atom.kv_transfer.disaggregation.types import CHUNKED_ADMISSION_TIMEOUT
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import InputOutputProcessor, load_tokenizer
 from atom.model_engine.request import RequestOutput
@@ -1025,6 +1026,11 @@ async def generate_async(
                     engine.core_mgr.abort_request(seq.id)
             engine.io_processor.requests.pop(seq.id, None)
 
+    if finish_reason == CHUNKED_ADMISSION_TIMEOUT:
+        raise ChunkedAdmissionTimeout(
+            f"Request {request_id}: chunked P/D admission timed out "
+            "before decode admitted it"
+        )
     text = "" if sampling_params.logprobs else delivered_text(all_token_ids)
     num_tokens_input = (
         seq.num_prompt_tokens
@@ -1388,13 +1394,21 @@ def _validate_chunked_receive(params: dict[str, Any] | None) -> None:
         )
 
 
-def _validate_kv_transfer_params(params: dict[str, Any] | None) -> None:
+def _validate_kv_transfer_params(
+    params: dict[str, Any] | None, stream: bool = False
+) -> None:
     """Refuse handoff metadata no leg can serve, before enqueue or SSE headers.
 
     Every endpoint that takes `kv_transfer_params` calls this first.
     """
     if not params:
         return
+    # A stream has answered 200 before an admission timeout could answer 424.
+    if stream and params.get("chunked_transfer") and params.get("do_remote_decode"):
+        raise HTTPException(
+            status_code=400,
+            detail="A chunked P/D prefill leg must not stream",
+        )
     _validate_chunked_receive(params)
     check_media_handoff(params, _get_engine_max_model_len())
 
@@ -1629,6 +1643,14 @@ def cleanup_request(request_id: str) -> None:
     """
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
+
+
+class ChunkedAdmissionTimeout(Exception):
+    """A chunked prefill leg gave up waiting for decode to admit its request.
+
+    Routes answer 424, which the P/D router neither retries nor counts
+    against the prefill's circuit breaker.
+    """
 
 
 class _ClientDisconnected(Exception):
@@ -2277,7 +2299,7 @@ async def _chat_completions(
     beta = isinstance(request, BetaChatCompletionRequest)
     route = "beta_chat_completions" if beta else "chat_completions"
     validate_model(request.model)
-    _validate_kv_transfer_params(request.kv_transfer_params)
+    _validate_kv_transfer_params(request.kv_transfer_params, request.stream)
 
     try:
         request.tools = normalize_chat_tools(request.tools)
@@ -2667,6 +2689,8 @@ async def _chat_completions(
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ChunkedAdmissionTimeout as e:
+        raise HTTPException(status_code=424, detail=str(e)) from e
     except ContextLengthError as e:
         logger.error(f"Validation error in {route}: {e}")
         # The same 400 body as any other, but with OpenAI's
@@ -2799,7 +2823,7 @@ async def _completions(
     beta = isinstance(request, BetaCompletionRequest)
     route = "beta_completions" if beta else "completions"
     validate_model(request.model)
-    _validate_kv_transfer_params(request.kv_transfer_params)
+    _validate_kv_transfer_params(request.kv_transfer_params, request.stream)
 
     try:
         effective_n = _coerce_n(request.n, request.temperature)
@@ -2965,6 +2989,8 @@ async def _completions(
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ChunkedAdmissionTimeout as e:
+        raise HTTPException(status_code=424, detail=str(e)) from e
     except ContextLengthError as e:
         logger.error(f"Validation error in {route}: {e}")
         # The same 400 body as any other, but with OpenAI's
@@ -2986,7 +3012,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     and returns Anthropic-formatted responses. Enables Claude Code and other
     Anthropic-compatible tools to use ATOM as a backend.
     """
-    _validate_kv_transfer_params(request.kv_transfer_params)
+    _validate_kv_transfer_params(request.kv_transfer_params, request.stream)
     # One validator over the shape both endpoints share: this path already
     # converts, so validating the conversion leaves a single rule rather than
     # a second one in Anthropic's spelling. It checked nothing before, so a
@@ -3350,6 +3376,14 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ChunkedAdmissionTimeout as e:
+        return JSONResponse(
+            status_code=424,
+            content={
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": str(e)},
+            },
+        )
     except ValueError as exc:
         message = (
             anthropic_context_length_message(
@@ -3423,7 +3457,7 @@ async def responses_create(raw_request: Request):
                 }
             },
         )
-    _validate_kv_transfer_params(kv_transfer_params)
+    _validate_kv_transfer_params(kv_transfer_params, bool(body.get("stream")))
     kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
 
     compatibility = api_compatibility_for(custom_message_encoder)
@@ -3713,6 +3747,8 @@ async def responses_create(raw_request: Request):
 
     except _ClientDisconnected:
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ChunkedAdmissionTimeout as e:
+        raise HTTPException(status_code=424, detail=str(e)) from e
     except ValueError as exc:
         return await value_error_handler(raw_request, exc)
     except Exception as e:

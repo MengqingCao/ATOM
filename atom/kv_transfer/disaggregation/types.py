@@ -27,6 +27,10 @@ EngineId = str
 ReqId = str | int
 TransferId = str | int
 
+# A chunked P/D producer request that decode never admitted in time. Keeps the
+# "aborted" prefix so reason readers still treat it as an abort.
+CHUNKED_ADMISSION_TIMEOUT = "aborted: chunked P/D admission timed out"
+
 
 def kv_config_has_producer(kv_config: object) -> bool:
     """Whether a KV config contains a P/D producer, including ``multi``.

@@ -776,3 +776,7 @@ the whole group.
   node), and so are barrier RPCs (the TP barrier is a local multiprocessing one).
 - The custom all-reduce is node-local, so collectives between nodes go through
   RCCL. On gfx950 also set `ATOM_USE_CUSTOM_ALL_GATHER=0`.
+
+## Design documents
+
+- [Chunked P/D admission timeouts](pd_admission_timeout.md): how a chunked prefill's admission timeout ends both legs with an error, and why a request decode admitted no longer times out.

@@ -3,7 +3,7 @@
 #   setsid nohup bash driver.sh > $S/driver.log 2>&1 < /dev/null &
 # acquire (-g 8 --wait) -> A/B1/B2 x c45/c64 x r1,r2 minus B2-c45-r1 (done), no smoke gate (ruling 7185214449),
 # all KIND=fixed (aiperf: one shared 127k prefix + unique 1k tail = 128k context, OSL 2k, prefix caching on; ov_spike.sh). One line a run in $S/driver_status.txt. Stops on the first
-# run without client data (a run past 1200 + WD_MARGIN s is stopped by the watchdog and counts as invalid), or on YIELD;
+# run without client data (a run not at aiperf in 75 min, or past 1200 + WD_MARGIN s after, is stopped by the watchdog and counts as invalid), or on YIELD;
 # always cleans its own containers and releases the lease (trap). A node whose GPUs a foreign (unleased) process
 # uses is released with --force and skipped; the queue re-acquires elsewhere, at most MAXTRIES grants in all.
 set -uo pipefail
@@ -87,7 +87,7 @@ drop() {
   $G release "$LEASE" --force --note "#81 driver: GPUs busy with a foreign unleased process ($1), nothing of ours ran; re-queuing elsewhere"
   : > $S/driver_lease; log "END released $LEASE on $NODE: foreign process"; bad="$bad $NODE"; LEASE=
 }
-log "CONFIG #81: #35 setup (NVFP4 KV + NVFP4 index on P and D, DSpark draft KV fp8, 2 TB Mooncake Store prefill tier, decode DP session affinity off, forced AL 4.04) with aiperf: one shared 130048-token prefix (pool size 1) + a unique 1024-token tail a request (128k context), OSL 2048 (stddev 0, ignore_eos), prefix caching ON on P and D (owner's ruling 7184230573); 1 warmup request at concurrency 1 computes the prefix once, then 5 x CONC measured requests; watchdog duration+${WD_MARGIN:-1800} s"
+log "CONFIG #81: #35 setup (NVFP4 KV + NVFP4 index on P and D, DSpark draft KV fp8, 2 TB Mooncake Store prefill tier, decode DP session affinity off, forced AL 4.04) with aiperf: one shared 130048-token prefix (pool size 1) + a unique 1024-token tail a request (128k context), OSL 2048 (stddev 0, ignore_eos), prefix caching ON on P and D (owner's ruling 7184230573); 1 warmup request at concurrency 1 computes the prefix once, then 5 x CONC measured requests; watchdog 75 min to aiperf start, then duration+${WD_MARGIN:-1800} s"
 grant
 
 yield() { $G mine | grep "$LEASE" | grep -q YIELD; }
@@ -98,8 +98,9 @@ run() {
   local spec=$1 t0 t1 tag kind valid who late=
   yield && { why="lease YIELD before '$spec'"; exit 0; }
   set -- ${spec#TRACE=1:}; tag=$1 kind=$3
-  # Watchdog: server start (~8 min) + 1-per-lane warmup + the window + drain must fit in duration + WD_MARGIN s, else the run is stuck.
-  local lim=$((SECONDS + 3600)); [[ $kind == agentx || $kind == fixed ]] && lim=$((SECONDS + $5 + ${WD_MARGIN:-1800}))
+  # Watchdog: an aiperf run gets 75 min to start (NFS weight load took 36 min on g52, run 20261126082103), then
+  # duration + WD_MARGIN s from aiperf's start (.aiperf_pid) for warmup + the window + drain, else the run is stuck.
+  local lim=$((SECONDS + 3600)) aip=; [[ $kind == agentx || $kind == fixed ]] && { lim=$((SECONDS + 4500)); aip=1; }
   who=$(foreign | paste -sd';')
   [[ -n $who ]] && { log "RUN $tag skipped: gpus busy by foreign process: $who"; drop "$who"; grant; run "$spec"; return; }
   t0=$(date -u +%FT%TZ)
@@ -114,6 +115,9 @@ run() {
     [[ -n $dir && -f $dir/run.txt ]] && { JOB=$(grep -o 'job=[0-9]*' "$dir/run.txt" | cut -d= -f2); break; }
   done
   while kill -0 $p 2>/dev/null; do
+    [[ -n $aip && -z $dir ]] && dir=$(newdir)
+    [[ -n $aip && -n $dir ]] && compgen -G "$dir/slurm_job-*/benchmark_results/*/.aiperf_pid" >/dev/null &&
+      { aip=; lim=$((SECONDS + $5 + ${WD_MARGIN:-1800})); log "RUN $tag aiperf started: watchdog in $(($5 + ${WD_MARGIN:-1800})) s"; }
     (( SECONDS > lim )) && { late=" watchdog-stopped"; log "RUN $tag past its watchdog limit: stopping it"; clean; kill $p 2>/dev/null; break; }
     sleep 30
   done

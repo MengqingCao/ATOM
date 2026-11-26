@@ -63,6 +63,14 @@ records the owner and the refresh time before it returns, so the next
 placement already counts the previous one. Four new sessions on DP=2 land on
 0, 1, 0, 1.
 
+```mermaid
+flowchart LR
+    L[one _lb_lock hold] --> A[s1: live 0 and 0, rank 0]
+    A --> B[s2: live 1 and 0, rank 1]
+    B --> C[s3: live 1 and 1, rank 0]
+    C --> D[s4: live 2 and 1, rank 1]
+```
+
 **S3. Later turn (A1: stays on owner).**
 
 ```mermaid
@@ -78,9 +86,26 @@ Session `s` on rank 1 receives no request for longer than
 rank 1 one lighter. Its `owners` entry is kept; its next turn takes S3's path,
 lands on rank 1 and is live again.
 
+```mermaid
+flowchart LR
+    I[s idle past the window] --> N[new session t]
+    N --> C[live count skips s, rank 1 one lighter]
+    C --> P[t placed by that count]
+    I --> T[next turn of s]
+    T --> H[owner rank 1, seen of s refreshed, live again]
+```
+
 **S5. Switch unset (A2).** `_dp_session_idle_s` is `None`, `SessionPolicy` is
 built exactly as today, and `get_dp_router_statistics` counts owners as today.
 The existing DP routing tests pass unedited.
+
+```mermaid
+flowchart LR
+    E[ATOM_DP_LEAST_SESSIONS unset] --> N[_dp_session_idle_s None]
+    N --> P[SessionPolicy built as today, spill as configured]
+    N --> G[dp_sessions counts owners]
+    P --> R[load-based new-session placement, unchanged]
+```
 
 **S6. Live DP=2 server (A4).**
 
@@ -108,9 +133,10 @@ Each decision with its basis and the strongest rejected alternative.
    Rejected: a `--dp-load-balance least_sessions` choice, which would have to
    say how sessionless requests are placed and widens a validated CLI list.
 2. **Idle window in seconds, `ATOM_DP_SESSION_IDLE_S`, default 7200.** Basis:
-   code: every duration env in `atom/utils/envs.py` is seconds with an `_S`
-   suffix and `_positive_float_env` exists; #85 Goal 2 fixes 120 minutes.
-   Rejected: a minute-valued env, the only one of its kind.
+   code: most duration envs in `atom/utils/envs.py` are seconds with an `_S`
+   suffix (`ATOM_SHUTDOWN_TIMEOUT_S`, `ATOM_MULTINODE_PG_TIMEOUT_S`), none
+   is in minutes, and `_positive_float_env` exists; #85 Goal 2 fixes 120
+   minutes. Rejected: a minute-valued env, the only one of its kind.
 3. **Switch without affinity is inert and warns.** Basis: code:
    `CoreManager.__init__` warns for `ATOM_DP_DISPATCH_DEPTH` under a policy
    that ignores it. Rejected: fail at startup, which the codebase reserves for

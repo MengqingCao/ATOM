@@ -3429,6 +3429,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn chunked_prefill_error_cancels_decode() {
+        /// Fires when the D handler's future is dropped, which axum does when
+        /// the router closes D's connection.
+        struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let d_arrived = Arc::new(tokio::sync::Notify::new());
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let dropped_tx = Arc::new(std::sync::Mutex::new(Some(dropped_tx)));
+        // D never answers.
+        let arrived = d_arrived.clone();
+        let d = serve(axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || async move {
+                let _guard = OnDrop(dropped_tx.lock().unwrap().take());
+                arrived.notify_one();
+                std::future::pending::<()>().await;
+            }),
+        ))
+        .await;
+        // P answers 424 once D holds the request, as on an admission timeout.
+        let prefill_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bodies = prefill_bodies.clone();
+        let p = serve(axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| async move {
+                bodies.lock().unwrap().push(body);
+                d_arrived.notified().await;
+                let error = json!({"error": {"message": "admission timed out", "code": 424}});
+                (StatusCode::FAILED_DEPENDENCY, axum::Json(error))
+            }),
+        ))
+        .await;
+        let mut router = atom_test_router(&p, true);
+        let mut info = AtomPrefillInfo::default();
+        info.tp_sizes.insert(p.clone(), 1);
+        info.chunked_transfer
+            .insert(p.clone(), json!({"remote_host": "127.0.0.1"}));
+        let a = Arc::new(AtomAdapter::new(Arc::new(info)));
+        router.adapter = a.clone();
+        router.atom_adapter = Some(a);
+
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let r = run_atom_pd(&router, &p, &d, body, LateKvRun::default()).await;
+        assert_eq!(
+            prefill_bodies.lock().unwrap()[0]["kv_transfer_params"]["chunked_transfer"],
+            true
+        );
+        assert_eq!(r.status, StatusCode::FAILED_DEPENDENCY, "{}", r.out);
+        r.assert_released();
+        tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+            .await
+            .expect("D's request was not dropped")
+            .unwrap();
+        let rebuilt = (r.status, axum::Json(r.out)).into_response();
+        assert!(!crate::routers::http_router::should_retry_inference(
+            "/v1/chat/completions",
+            &rebuilt
+        ));
+    }
+
     pub(super) fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry =

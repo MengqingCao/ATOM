@@ -345,6 +345,12 @@ pub(crate) fn parse_vllm_engine_loads(body: &str) -> HashMap<&str, [Option<f64>;
 /// `1000 * (running + waiting)` plus the KV per-mille as a tie-break, over engine
 /// `rank`, or over every engine (requests summed, KV averaged) without one. Any
 /// gauge missing on an engine it reads, or no engine at all, gives no load.
+///
+/// Why 1000: the load is one `isize` because `PowerOfTwoPolicy` compares one
+/// cached value per worker, so two keys are packed into it. The request count
+/// decides first and KV usage only breaks a tie: KV is in per-mille (0.1% steps)
+/// and capped at 999, so one request (1000) outweighs any KV usage and a full
+/// cache never reads as one more request. The scale is fixed, not a tuning knob.
 fn vllm_load(engines: &HashMap<&str, [Option<f64>; 3]>, rank: Option<usize>) -> Option<isize> {
     let rank = rank.map(|rank| rank.to_string());
     let (mut requests, mut kv, mut count) = (0.0, 0.0, 0usize);

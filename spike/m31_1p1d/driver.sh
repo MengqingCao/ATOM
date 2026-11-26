@@ -44,7 +44,7 @@ foreign() {
     else u=$(ps -o uid= -p $p | tr -d " "); [ -n "$u" ] && [ "$u" != "$(id -u)" ] && echo "pid $p uid $u"; fi
   done' | sort -u | grep -vE "^container (mengqing-dep4-35-|atomesh-.*-(${jobs:-NONE})-[0-9]+)"
 }
-bad=; tries=0; MAXTRIES=4
+bad=; tries=0; MAXTRIES=8  # most cache-heavy nodes fail the MemFree check below
 # Take a whole node (never one in $bad), get the image on it, and check no one else is on its GPUs.
 grant() {
   local nodes out who
@@ -68,10 +68,12 @@ grant() {
     if ! ssh "$HOST" docker image inspect "$IMG" >/dev/null 2>&1; then
       $G touch "$LEASE"; log "prep_image.sh $NODE"; bash "$D/prep_image.sh" "$NODE" || { why="prep_image failed"; exit 1; }
     fi
-    # The prefill's 2 TB (1863 GiB) Store pins 930 GiB a NUMA node (+128 GiB launcher reserve): MemFree + page cache must hold it.
-    mem=$(ssh "$HOST" 'for n in 0 1; do awk "/MemFree|FilePages/{s+=\$4} END{print int(s/1048576)}" /sys/devices/system/node/node$n/meminfo; done' | paste -sd' ')
-    log "MEM $NODE free+cache GiB per NUMA node: ${mem:-?} (Store needs 1058 each)"
-    for m in ${mem:-0}; do ((m >= 1058)) || { drop "host memory short for the 2 TB Store (free+cache GiB per NUMA: $mem)"; continue 2; }; done
+    # The prefill's 2 TB (1863 GiB) Store pins 930 GiB a NUMA node; the launcher compacts 930 + min(128, 930/16) = 988 GiB
+    # of each into huge pages. Page cache does not count: reclaiming 1200 GiB of it through compaction overran 600 s on g40
+    # (run 20261126032634), and dropping the node's shared cache would hurt other users. Need MemFree >= 988 on each node.
+    mem=$(ssh "$HOST" 'for n in 0 1; do awk "/MemFree/{print int(\$4/1048576)}" /sys/devices/system/node/node$n/meminfo; done' | paste -sd' ')
+    log "MEM $NODE free GiB per NUMA node: ${mem:-?} (Store compacts 988 each)"
+    for m in ${mem:-0}; do ((m >= 988)) || { drop "host memory short for the 2 TB Store (MemFree GiB per NUMA: $mem, page cache not counted)"; continue 2; }; done
     who=$(foreign | paste -sd';'); [[ -z $who ]] && return 0
     drop "$who"
   done

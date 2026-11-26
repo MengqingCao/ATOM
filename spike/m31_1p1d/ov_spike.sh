@@ -20,9 +20,10 @@ assert s.count(a) == 1, "is_agentic_dpa in pd_server_atom.sh changed"
 open(p, "w").write(s.replace(a, a + "  return 1  # ATOM#35: decode DP session affinity off\n"))
 PY
 export AIPERF_WARMUP_REQUESTS_PER_LANE=1
-# Owner's ruling (#35, issuecomment-7167528921): a 2 TiB Mooncake Store CPU (host DRAM) KV tier for the prefill,
+# Owner's ruling (#35, issuecomment-7167528921): a 2 TB (decimal, 1863 GiB) Mooncake Store CPU (host DRAM) KV tier for the prefill,
 # through the launcher's MOONCAKE_STORE=1 (ATOM_KV_OFFLOAD=mooncake_store behind the P/D connector). The decode
-# keeps no tier (ATOM's Store is the prefill's offload tier). 4 owners x 512 GiB, one per NIC: an owner above
-# 832 GiB may not register on an ionic NIC; 1024 GiB a NUMA node + the launcher's 128 GiB reserve fits 1511 GiB.
+# keeps no tier (ATOM's Store is the prefill's offload tier). 4 owners x 465 GiB, one per NIC: an owner above
+# 832 GiB may not register on an ionic NIC; 930 GiB a NUMA node stays under the ~1017 GiB a node compacts to huge pages
+# (2 TiB = 1024 GiB a node failed rc=134 on g48 and g40).
 export ATOMESH_PREFILL_ENV_MOONCAKE_STORE=1
-export ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS="0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7"
+export ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS="0:465:rdma4;0:465:rdma5;1:465:rdma6;1:465:rdma7"

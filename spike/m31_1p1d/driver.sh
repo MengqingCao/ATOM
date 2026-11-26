@@ -53,8 +53,14 @@ grant() {
     nodes=$($G status --json | python3 -c "import json,sys;b='$bad'.split();print(','.join(n for n in json.load(sys.stdin)['free'] if n not in b))")
     [[ -n $nodes ]] || { why="no pool node left outside ${bad}"; exit 1; }
     log "START acquiring a whole node (attempt $tries, nodes $nodes)"
-    out=$($G acquire -g 8 --node "$nodes" -p "MengqingCao/ATOM#35 spike: M3.1 1P1D A/B1/B2 AgentX c140/c150 + GSM8K-200 + A1 rerun, prefill 2 TiB Mooncake CPU KV tier (~10h)" --wait --timeout 3h) \
-      || { why="acquire rc=$? (timed out or refused)"; exit 1; }
+    local arc stale=0
+    while :; do  # an NFS "Stale file handle" (errno 116) in gpool is transient: retry it, at most 5 times
+      out=$($G acquire -g 8 --node "$nodes" -p "MengqingCao/ATOM#35 spike: M3.1 1P1D A/B1/B2 AgentX c140/c150 + GSM8K-200 + A1 rerun, prefill 2 TB Mooncake CPU KV tier (~10h)" --wait --timeout 3h 2>&1); arc=$?
+      ((arc == 0)) && break
+      echo "$out"
+      grep -qiE 'stale file handle|errno 116' <<<"$out" && ((++stale <= 5)) || { why="acquire rc=$arc (timed out or refused)"; exit 1; }
+      log "acquire hit a stale NFS file handle (rc=$arc): retry $stale/5 in 60 s"; sleep 60
+    done
     echo "$out"
     LEASE=$(grep -o 'L[0-9a-f]\{6\}' <<<"$out" | head -1); HOST=$(grep -o 'pit2-p03-g[0-9]*' <<<"$out" | head -1); NODE=${HOST#pit2-p03-}
     [[ -n $LEASE && -n $NODE ]] || { why="cannot parse grant: $out"; exit 1; }
@@ -62,10 +68,10 @@ grant() {
     if ! ssh "$HOST" docker image inspect "$IMG" >/dev/null 2>&1; then
       $G touch "$LEASE"; log "prep_image.sh $NODE"; bash "$D/prep_image.sh" "$NODE" || { why="prep_image failed"; exit 1; }
     fi
-    # The prefill's 2 TiB Store pins 1024 GiB a NUMA node (+128 GiB launcher reserve): MemFree + page cache must hold it.
+    # The prefill's 2 TB (1863 GiB) Store pins 930 GiB a NUMA node (+128 GiB launcher reserve): MemFree + page cache must hold it.
     mem=$(ssh "$HOST" 'for n in 0 1; do awk "/MemFree|FilePages/{s+=\$4} END{print int(s/1048576)}" /sys/devices/system/node/node$n/meminfo; done' | paste -sd' ')
-    log "MEM $NODE free+cache GiB per NUMA node: ${mem:-?} (Store needs 1152 each)"
-    for m in ${mem:-0}; do ((m >= 1152)) || { drop "host memory short for the 2 TiB Store (free+cache GiB per NUMA: $mem)"; continue 2; }; done
+    log "MEM $NODE free+cache GiB per NUMA node: ${mem:-?} (Store needs 1058 each)"
+    for m in ${mem:-0}; do ((m >= 1058)) || { drop "host memory short for the 2 TB Store (free+cache GiB per NUMA: $mem)"; continue 2; }; done
     who=$(foreign | paste -sd';'); [[ -z $who ]] && return 0
     drop "$who"
   done
@@ -77,7 +83,7 @@ drop() {
   $G release "$LEASE" --force --note "#35 driver: GPUs busy with a foreign unleased process ($1), nothing of ours ran; re-queuing elsewhere"
   : > $S/driver_lease; log "END released $LEASE on $NODE: foreign process"; bad="$bad $NODE"; LEASE=
 }
-log "CONFIG #35 ruling 7167528921, all arms: prefill KV CPU tier = Mooncake Store 2 TiB host DRAM (MOONCAKE_STORE=1, owners 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7; ATOM_KV_OFFLOAD=mooncake_store via launcher; decode no tier); ruling 7164687062: decode DP session affinity off (no dp_sticky/--dp-aware/X-Session-ID; router policy random), AgentX warmup_requests_per_lane=1 (was 10), window 1200 s, warmup_grace_period 1800 s; watchdog agentx duration+${WD_MARGIN:-1800} s, gsm8k 3600 s"
+log "CONFIG #35 ruling 7167528921, all arms: prefill KV CPU tier = Mooncake Store 2 TB = 1863 GiB host DRAM (MOONCAKE_STORE=1, owners 0:465:rdma4;0:465:rdma5;1:465:rdma6;1:465:rdma7, 930 GiB a NUMA node under the ~1017 GiB huge-page ceiling; ATOM_KV_OFFLOAD=mooncake_store via launcher; decode no tier); ruling 7164687062: decode DP session affinity off (no dp_sticky/--dp-aware/X-Session-ID; router policy random), AgentX warmup_requests_per_lane=1 (was 10), window 1200 s, warmup_grace_period 1800 s; watchdog agentx duration+${WD_MARGIN:-1800} s, gsm8k 3600 s"
 grant
 
 yield() { $G mine | grep "$LEASE" | grep -q YIELD; }

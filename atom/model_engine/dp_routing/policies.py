@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -48,6 +49,10 @@ class SessionPolicy(LoadPolicy):
     more requests than the mean while that one runs at least as many fewer.
     Under DP-attention every rank waits for the busiest one's step, and the
     move costs only the copy of its history from the old rank's pool.
+
+    With `idle_s`, a new session goes instead to the rank holding the fewest
+    live sessions -- routed to within the last `idle_s` seconds -- the lowest
+    index on a tie.
     """
 
     stateful = True
@@ -62,6 +67,7 @@ class SessionPolicy(LoadPolicy):
         parent_ignored: Callable[[], None],
         rank_reqs: Callable[[], list[int]] | None = None,
         margin: float = 0.1,
+        idle_s: float | None = None,
     ) -> None:
         super().__init__(lightest)
         self.select_session = select_session
@@ -71,6 +77,20 @@ class SessionPolicy(LoadPolicy):
         self.parent_ignored = parent_ignored
         self.rank_reqs = rank_reqs
         self.margin = margin
+        self.idle_s = idle_s
+        # Session id -> time.monotonic() of its last routed request.
+        self.seen: dict = {}
+
+    def live_counts(self) -> list[int]:
+        """Per rank, the sessions it owns that were routed within `idle_s`."""
+        now = time.monotonic()
+        live = [0] * self.rank_count
+        for session, rank in self.owners.items():
+            seen = self.seen.get(session)
+            live_now = seen is not None and now - seen <= self.idle_s
+            if live_now and 0 <= rank < self.rank_count:
+                live[rank] += 1
+        return live
 
     def _relieve(self, owner: int) -> int | None:
         """The rank a session on crowded `owner` moves to, or None."""
@@ -95,7 +115,11 @@ class SessionPolicy(LoadPolicy):
             owner = explicit_rank
             decision = "explicit_total"
         elif owner is None or not 0 <= owner < self.rank_count:
-            owner = self.select_session(session)
+            if self.idle_s is None:
+                owner = self.select_session(session)
+            else:
+                live = self.live_counts()
+                owner = live.index(min(live))
             decision = "affinity_new_total"
             if getattr(seq, "dp_parent_session_id", None):
                 self.parent_ignored()
@@ -106,6 +130,7 @@ class SessionPolicy(LoadPolicy):
                 owner = target
                 decision = "affinity_spill_total"
         self.owners[session] = owner
+        self.seen[session] = time.monotonic()
         return Route(owner, decision, self.prompts.get(session, 0))
 
     def charge(self, seq: Any, credit: int) -> int:
@@ -117,6 +142,7 @@ class SessionPolicy(LoadPolicy):
     def reset(self) -> None:
         self.owners.clear()
         self.prompts.clear()
+        self.seen.clear()
 
 
 class PrefixPolicy(LoadPolicy):

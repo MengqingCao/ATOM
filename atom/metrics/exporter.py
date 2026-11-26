@@ -176,8 +176,9 @@ class _AtomMetricsCollector:
             (
                 "atom:dp_affinity_new",
                 (
-                    "Number of new sticky DP sessions assigned to a load-aware "
-                    "cache owner."
+                    "Number of new sticky DP sessions assigned a cache owner, "
+                    "the lightest rank or, under ATOM_DP_LEAST_SESSIONS, the "
+                    "rank with the fewest live sessions."
                 ),
                 dp_router.get("affinity_new_total", 0),
             ),
@@ -310,7 +311,10 @@ class _AtomMetricsCollector:
             ),
             (
                 "atom:dp_sessions",
-                "Sticky sessions currently owned by each data-parallel rank.",
+                (
+                    "Sticky sessions currently owned by each data-parallel rank; "
+                    "under ATOM_DP_LEAST_SESSIONS, only live sessions."
+                ),
                 dp_router.get("session_count_per_rank", []),
             ),
         ):

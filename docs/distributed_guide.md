@@ -297,8 +297,17 @@ life of the process, so a busy owner never causes a later turn to lose its
 prefix-cache locality. Child correlation IDs are independent sessions and do
 not inherit the parent's rank. For an established session, load accounting
 charges only positive prompt-length growth rather than repeatedly charging the
-complete cached conversation. An opt-in least-session placement of new
-sessions is designed in [dp_least_session.md](dp_least_session.md).
+complete cached conversation.
+
+With `ATOM_DP_LEAST_SESSIONS=1` as well, a new session goes instead to the
+rank holding the fewest live sessions, the lowest index on a tie. A session
+is live while its last request was routed at most `ATOM_DP_SESSION_IDLE_S`
+seconds ago (default 7200); an idle session stops counting for its rank but
+keeps its owner, and its next turn goes there and makes it live again.
+Established sessions never move, even when a pool-sharing connector sets a
+migrate margin, and `atom:dp_sessions` reports the live count per rank.
+Without session affinity the switch has no effect and init warns. Design:
+[dp_least_session.md](dp_least_session.md).
 
 The OpenAI server reads the session ID from `X-Dynamo-Session-ID`, falling back
 to `X-Correlation-ID`; `X-Dynamo-Parent-Session-ID` is retained for routing
@@ -331,6 +340,10 @@ drained and warns if it is invoked while requests are still charged.
 - Env: `ATOM_DP_DISPATCH_DEPTH` (int, default `0`): per-rank in-flight cap for lazy dispatch of an offline batch (`LLMEngine.generate` / `generate_multimodal`). Online API admission is unchanged. While it is positive, that offline routing balances on in-flight request count and ignores `round_robin` and `least_tokens`; init warns when `dp_load_balance` is not `least_requests`. Under `prefix_spread` and `share_cache` the depth is ignored (init warns). A failed send returns the requests to the pending pool. `abort_request` removes a request that has not been sent yet.
 - Env: `ATOM_DP_SESSION_AFFINITY` (bool, default `0`): load-place each new
   session once, then keep all later turns on its cache owner without spill.
+- Env: `ATOM_DP_LEAST_SESSIONS` (bool, default `0`): with session affinity,
+  place each new session on the rank with the fewest live sessions.
+- Env: `ATOM_DP_SESSION_IDLE_S` (float seconds, default `7200`): the idle
+  window after which a session stops counting as live.
 
 ## Expert Parallelism (EP)
 
@@ -434,6 +447,8 @@ The block configuration adapts to the batch type: prefill uses `block_num=128, w
 | `ATOM_DP_MASTER_PORT` | int | `29500` | Port for DP Gloo rendezvous |
 | `ATOM_DP_LB_REQ_EQUIV` | int | `512` | Token-equivalent cost of one in-flight request for the `least_tokens` DP load-balance strategy |
 | `ATOM_DP_SESSION_AFFINITY` | bool | `0` | Load-place a new session, then keep later turns on its immutable prefix-cache owner |
+| `ATOM_DP_LEAST_SESSIONS` | bool | `0` | With session affinity, place a new session on the rank with the fewest live sessions (rank 0 on a full tie) |
+| `ATOM_DP_SESSION_IDLE_S` | float | `7200` | Least-session placement: seconds since a session's last routed request after which it stops counting as live |
 | ~~`ATOM_ENFORCE_EAGER`~~ | | | Removed. Use CLI flag `--enforce-eager` instead. |
 | `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `False` | Fuse QK-norm + RoPE + cache quant for Qwen3 dense and MoE models |
 

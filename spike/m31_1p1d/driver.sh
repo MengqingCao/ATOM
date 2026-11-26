@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Unattended #81 queue on ONE whole node, run detached on the dev host:
 #   setsid nohup bash driver.sh > $S/driver.log 2>&1 < /dev/null &
-# acquire (-g 8 --wait) -> smoke B2-c45-r1 (gate: decode batch >= 0.8 x 45, else stop for a ruling) -> A/B1/B2 x c45/c64 x r1,r2,
+# acquire (-g 8 --wait) -> A/B1/B2 x c45/c64 x r1,r2 minus B2-c45-r1 (done), no smoke gate (ruling 7185214449),
 # all KIND=fixed (aiperf: one shared 127k prefix + unique 1k tail = 128k context, OSL 2k, prefix caching on; ov_spike.sh). One line a run in $S/driver_status.txt. Stops on the first
 # run without client data (a run past 1200 + WD_MARGIN s is stopped by the watchdog and counts as invalid), or on YIELD;
 # always cleans its own containers and releases the lease (trap). A node whose GPUs a foreign (unleased) process
@@ -137,19 +137,11 @@ run() {
   done_n=$((done_n + 1))
   log "RUN $tag rc=${rc:-?}$late valid=$valid start=$t0 end=$t1 dir=${dir:-none}"
   [[ $kind == fixed && -n $dir ]] && log "PREFIX $tag $(python3 $D/prefix_stats.py "$dir" 2>&1 | tail -1)"
+  [[ -n $dir ]] && log "METRICS $tag decode batch mean/p90, TPOT p50/p90 ms, TTFT p50/p90 s, out tok/s/GPU = $(python3 -c "import json;d=json.load(open('$dir/report.json'));e=d['decode'];c=d['client'];print(e.get('batch_mean'), e.get('batch_p90'), c.get('tpot_p50_ms'), c.get('tpot_p90_ms'), c.get('ttft_p50_s'), c.get('ttft_p90_s'), c.get('out_tok_s_per_gpu'))" 2>&1 | tail -1)"
   [[ $valid == yes ]]
 }
 
-# Smoke = B2-c45-r1, kept as the matrix's first run when it passes. Gate: prefix caching on (P and D engine kwargs) and the
-# decode running batch (window mean) >= 0.8 x CONC; below it the shared prefix did not make prefill cheap enough: ruling on #81.
-run 'B2-c45-r1 B2 fixed 45 1200' || { why="smoke B2-c45-r1 invalid: diagnose"; exit 1; }
-for s in prefill decode; do
-  grep -qs "'enable_prefix_caching': True" "$dir"/slurm_job-*/logs/$s-rank-0.log || { why="smoke B2-c45-r1: prefix caching not on ($s): diagnose"; exit 1; }
-done
-sm=$(python3 -c "import json;d=json.load(open('$dir/report.json'));e=d['decode'];print(e.get('batch_mean_all', e.get('batch_mean')), e.get('batch_mean'), e.get('batch_p90'), d['prefill'].get('computed_tok_s'), d['client'].get('req_s'), d['client'].get('out_tok_s_per_gpu'))" 2>/dev/null)
-log "SMOKE decode batch mean(all) mean(busy) p90, prefill computed tok/s, req/s, out tok/s/GPU = ${sm:-none} (CONC 45)"
-python3 -c "import sys;sys.exit(not float('${sm%% *}') >= 0.8 * 45)" 2>/dev/null \
-  || { why="smoke B2-c45-r1: decode batch ${sm%% *} < 36 of 45, prefill-bound: ruling needed on #81"; exit 1; }
+# No smoke gate (owner's ruling 7185214449): B2-c45-r1 (run 20261126062333) is done and valid; run the rest of the matrix.
 for r in 1 2; do for c in 45 64; do for a in A B1 B2; do
   [[ $a$c$r == B2451 ]] && continue
   run "$a-c$c-r$r $a fixed $c 1200" || { why="$a-c$c-r$r invalid: diagnose"; exit 1; }

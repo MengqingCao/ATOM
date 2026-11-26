@@ -44,8 +44,9 @@ Defaults overridden: none.
 
 ### S1. Unadmitted request times out (A1, A2)
 
-D has no room, so the request is never ready. P expires it, answers 429, and
-the router drops D's leg before D admits it.
+D has no room, so the request is never ready. P expires it and answers 424,
+the router drops D's leg before D admits it, and the client gets the 424 at
+once: `should_retry_inference` does not retry it.
 
 ```mermaid
 sequenceDiagram
@@ -63,10 +64,11 @@ sequenceDiagram
     Note over P: deadline passes, not ready
     P->>P: leave_reason = CHUNKED_ADMISSION_TIMEOUT
     P->>P: cancellation retires the transfer
-    P-->>R: 429 + error body
+    P-->>R: 424 + error body
     R->>D: try_join drops the leg (connection closed)
     D->>D: disconnect, abort_request, seq leaves waiting with no pages
-    R-->>C: 429 prefill_error
+    R->>R: dispatch_pd: should_retry_inference(424) is false, no retry
+    R-->>C: 424 prefill_error
 ```
 
 ### S2. D admits just as P expires (A2, principle 1)
@@ -84,7 +86,7 @@ sequenceDiagram
     Note over P: deadline passes before ready reaches the scheduler
     P->>P: expire, retire transfer
     P->>D: transfer result: failed
-    P-->>R: 429
+    P-->>R: 424
     R->>D: drop the leg
     D->>D: abort waits for the receive's terminal report
     D->>D: failed-write path frees the pages
@@ -121,15 +123,20 @@ flowchart TD
     A[ready request waits for P room] --> B{room frees?}
     B -- yes --> C[S3 success]
     B -- no --> D[router client timeout on the P leg, request_timeout_secs]
-    D --> E[router answers 502 and drops the D leg]
+    D --> E[attempt answers 502 prefill_server_error and drops the D leg]
     D --> F[P sees the disconnect and aborts the waiting request]
     F --> G[cancellation fails D's receive]
     E --> H[D abort waits for the terminal report]
     G --> H
     H --> I[failed-write path frees D's pages]
+    E --> J{dispatch_pd: attempts left?}
+    J -- yes, 502 is retryable --> K[new pair, new attempt] --> A
+    J -- no --> L[client gets 502]
 ```
 
-A client disconnect takes the same path from D and F.
+Each attempt holds its D pages at most `request_timeout_secs` plus the
+failed-write hold, and the client waits at most `max_retries` attempts
+(decision 11). A client disconnect ends every leg at once, from D and F.
 
 ### S5. Streaming chunked prefill leg (Goal 1)
 
@@ -145,7 +152,7 @@ flowchart LR
 flowchart TD
     A[request ends on P or D] --> B{finish reason is CHUNKED_ADMISSION_TIMEOUT?}
     B -- no --> C[same response as today, including plain aborted]
-    B -- yes --> D[429, S1]
+    B -- yes --> D[424, S1]
 ```
 
 Only `_expire_chunked_admission` sets the new reason, and only for a chunked
@@ -169,27 +176,36 @@ P request; non-chunked P/D and non-P/D serving never produce it.
    `leave_reason`; nothing else sets `leave_reason` on a waiting seq, so other
    callers keep "aborted". principle: Fix shared code, not callers. Rejected:
    passing the reason at each ABORTED call site.
-3. **The reason keeps the "aborted" prefix.** `produced_no_handoff` matches the
-   prefix, so the producer still publishes a cancellation;
-   `serving_responses.py: response_status` already splits on ":".
-   `Scheduler._mark_finished`'s `reason == "aborted"` serves running finishes,
-   which this reason never reaches. principle: Names match what the code does.
-   Rejected: a separate word such as `pd_admission_timeout`, which every abort
-   check would need to learn.
-4. **The status is 429.** Basis: code: in `http_pd_router.rs`,
-   `WorkerOutcome::drop` and `WorkerOutcome::finish` count a 5xx against the
-   prefill's circuit breaker (`src/core/worker.rs: Worker::record_outcome`) and
-   a 4xx against nothing. P is healthy; D lacked room. 429 is retryable like
-   503 (`src/core/retry.rs: is_retryable_status`). Rejected: 500 or 503. Under
-   the #617 load a run of timeouts opens P's breaker, and the router then
-   rejects chunked requests that would have succeeded (Goal 3).
-5. **`generate_async` raises; four routes answer 429.** `generate_async` raises
-   a new `ChunkedAdmissionTimeout` when its final `finish_reason` is the
+3. **The reason keeps the "aborted" prefix.** Readers that split a reason on
+   ":" keep treating it as an abort (`serving_responses.py: response_status`).
+   `produced_no_handoff` needs no change: an expired request never ran, so
+   `Sequence.prefill_completed` is False and the producer publishes a
+   cancellation. `Scheduler._mark_finished`'s `reason == "aborted"` serves
+   running finishes, which this reason never reaches. principle: Names match
+   what the code does. Rejected: a separate word such as
+   `pd_admission_timeout`, which reads as a normal finish to those readers.
+4. **The status is 424 Failed Dependency, which nothing retries.** The prefill
+   failed because the decode admission it depends on did not happen. Basis:
+   code: in `http_pd_router.rs`, `WorkerOutcome::drop` and
+   `WorkerOutcome::finish` count a 5xx against the prefill's circuit breaker
+   (`src/core/worker.rs: Worker::record_outcome`) and a 4xx against nothing;
+   `src/core/retry.rs: is_retryable_status` retries 408, 429, 500, 502, 503 and 504, so
+   `http_router.rs: should_retry_inference` answers false for 424 and the
+   client gets it at once, as #617 fix 3 asks. The OpenAI SDK retries 408,
+   409, 429 and 5xx, not 424. Rejected: 429, which the router retries on a new
+   pair (in 1P setups the same overloaded prefill, with a fresh deadline), so
+   the client waits up to `max_retries` timeouts; 500 or 503, which also open
+   P's breaker under the #617 load and then reject chunked requests that would
+   have succeeded (Goal 3); 400, which tells the client its request is
+   invalid.
+5. **`generate_async` raises; four routes answer 424.** `generate_async` raises
+   a new `ChunkedAdmissionTimeout` (a plain `Exception`, never a `ValueError`,
+   which `/v1/messages` maps to 400) when its final `finish_reason` is the
    constant. The routes that take `kv_transfer_params` catch it beside
    `_ClientDisconnected`. Chat, completions and responses raise
-   `HTTPException(429, message)`, which `openai_http_error_handler` wraps in
-   the OpenAI envelope (`{"error": {"message", "type", "code": 429}}`).
-   `/v1/messages` returns its Anthropic envelope with type `rate_limit_error`.
+   `HTTPException(424, message)`, which `openai_http_error_handler` wraps in
+   the OpenAI envelope (`{"error": {"message", "type", "code": 424}}`).
+   `/v1/messages` returns its Anthropic envelope with type `overloaded_error`.
    Basis: code: every non-stream leg reaches `generate_async`, chat and
    completions directly, messages and responses through `_generate_nonstream`.
    A chunked leg has n=1 and no media (`atom/mesh/src/core/placement/backend/atom.rs:
@@ -212,13 +228,12 @@ P request; non-chunked P/D and non-P/D serving never produce it.
    the router needs a change to cancel decode. Rejected: forwarding P's error
    message through `handle_prefill_error_response`, a change the scope does not
    admit.
-8. **Router retries stay as they are.** `PDRouter::dispatch_pd` retries a 429 on
-   a new pair up to `max_retries` (`RetryConfig::default`: 5) unless
-   `--disable-retries`; `/v1/responses` retries only unsent failures
-   (`http_router.rs: should_retry_inference`). Each attempt cancels its own D
-   leg, so a retry leaks nothing; worst case the client waits `max_retries`
-   timeouts. Basis: the #93 scope, as in decision 7. Rejected: a non-retryable
-   error code, a router change.
+8. **The router's retry policy is unchanged.** 424 is outside
+   `is_retryable_status`, so `PDRouter::dispatch_pd` returns it on the first
+   attempt (S1); no router change is needed for that. Basis: code:
+   `dispatch_pd`, `should_retry_inference`; #93 admits router changes only to
+   cancel decode. Rejected: a retryable status with a non-retryable error code
+   in `NON_RETRYABLE_ERROR_CODES`, a router change the scope does not admit.
 9. **Decode is unchanged.** A dropped non-stream leg: `_race_disconnect` cancels
    `generate_async`, whose `finally` calls `CoreManager.abort_request`; a stream
    leg: `cleanup_stream(aborted=True)`. `CoreManager.abort_request` takes the
@@ -238,10 +253,16 @@ P request; non-chunked P/D and non-P/D serving never produce it.
 11. **No P deadline bounds a ready request.** P claims a source (`_awaiting_send`
     in `update_state_after_alloc`) only at allocation, which `admission_ready`
     allows only when ready, so every pinned P page belongs to a request D
-    admitted and drains as its transfer ends. The router's client timeout
-    (`request_timeout_secs`, default 1800 s, set in
-    `atom/mesh/src/app_context.rs: AppContextBuilder::with_client`) or a client
-    disconnect ends both legs (S4). Basis: code: those symbols; Goal 2.
+    admitted and drains as its transfer ends. Otherwise the router's client
+    timeout (`request_timeout_secs`, default 1800 s, set in
+    `atom/mesh/src/app_context.rs: AppContextBuilder::with_client`) ends the
+    attempt: the P leg's reqwest error becomes 502 `prefill_server_error`,
+    which `should_retry_inference` retries on a new pair. So a ready request
+    with no P room holds each attempt's D pages at most `request_timeout_secs`
+    plus the failed-write hold, and the client waits at most `max_retries`
+    attempts (`RetryConfig::default`: 5; `RetryExecutor::execute_response_with_retry`
+    counts the first attempt), each cancelling its legs before the next (S4).
+    A client disconnect ends it at once. Basis: code: those symbols; Goal 2.
     Rejected: a second, longer deadline for ready requests, a new setting that
     brings back dropping an admitted request.
 12. **Two existing tests change.** In `tests/test_pd_chunked_transfer.py`,
@@ -259,9 +280,10 @@ P request; non-chunked P/D and non-P/D serving never produce it.
 
 Return 500 by letting `generate_async` raise and each route's existing
 `except Exception` answer, with no route edit and no new exception class. It
-meets A1 to A3 but fails Goal 3 (A4's intent): 5xx answers count against the
-prefill's circuit breaker (decision 4), so a burst of timeouts opens it and the
-router rejects chunked requests that would have succeeded. Mapping every
+fails Goal 3 (A4's intent): 5xx answers count against the prefill's circuit
+breaker (decision 4), so a burst of timeouts opens it and the router rejects
+chunked requests that would have succeeded. It also fails Goal 1's "the client
+gets an error" at once: the router retries a 500. Mapping every
 `aborted` finish to an error, with no new reason, fails #94's exit criterion
 that other aborts keep their response.
 
@@ -277,31 +299,30 @@ line; S2 and S4 rely only on the failed-write path as it is on
 
 ## Summary
 
-- **Deliverable**: a chunked P admission timeout answers 429 with an error body
+- **Deliverable**: a chunked P admission timeout answers 424 with an error body
   and cancels the D leg before D admits it; a request D admitted no longer times
   out on P.
 - **Scope**: `atom/kv_transfer/disaggregation/types.py`,
   `atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py`,
   `atom/model_engine/scheduler.py`, `atom/entrypoints/openai/api_server.py`,
   tests. Non-goals: #93's (fix 2, fix 5, the default timeout, #626, #606), and
-  the router's retry policy (decision 8).
+  the router's retry policy (decisions 8 and 11).
 - **Changes per file**:
-  - `types.py`: `CHUNKED_ADMISSION_TIMEOUT`; `produced_no_handoff` matches the
-    "aborted" prefix.
+  - `types.py`: `CHUNKED_ADMISSION_TIMEOUT`.
   - `mooncake_connector.py`: `_expire_chunked_admission` skips ready requests
     and sets the new reason; log text.
   - `scheduler.py`: `_finish_rejected_waiting` and
     `_finish_rejected_waiting_cancelling` keep a preset reason.
   - `api_server.py`: `ChunkedAdmissionTimeout` raised by `generate_async`;
-    the 429 clause in chat, completions, messages and responses;
+    the 424 clause in chat, completions, messages and responses;
     `_validate_kv_transfer_params` refuses a streaming chunked P leg.
   - `atom/mesh`: no production change.
 - **Tasks**:
-  - **T1, Python** (code about 50 lines, tests about 200). Files: the four
+  - **T1, Python** (code about 45 lines, tests about 200). Files: the four
     above and `tests/test_pd_chunked_transfer.py`. New tests:
-    `test_admission_timeout_answers_429` (A1: a real producer `Scheduler`
+    `test_admission_timeout_answers_424` (A1: a real producer `Scheduler`
     expires the request; its reason, delivered through a stubbed
-    `api_server.engine`, makes chat and completions answer 429 with an error
+    `api_server.engine`, makes chat and completions answer 424 with an error
     body; a plain `aborted` still answers 200; a streaming chunked P leg
     answers 400),
     `test_decode_abort_drops_an_unadmitted_chunked_request` (A2 decode: no
@@ -312,7 +333,8 @@ line; S2 and S4 rely only on the failed-write path as it is on
   - **T2, Rust** (code 0, tests about 70). File:
     `atom/mesh/src/routers/http_pd_router.rs` tests. New test
     `chunked_prefill_error_cancels_decode` (A2 router): a chunked P mock
-    answering 429 and a D mock that never answers; `run_atom_pd` returns 429
-    and the D mock sees its request dropped. T1 and T2 are independent.
+    answering 424 and a D mock that never answers; `run_atom_pd` returns 424,
+    the D mock sees its request dropped, and `should_retry_inference` answers
+    false for that response, so `dispatch_pd` would not retry it. T1 and T2 are independent.
 - **Acceptance**: A1, A2 decode side and A3 by T1; A2 router side by T2; A4
   (gate on the line's head) after both land.

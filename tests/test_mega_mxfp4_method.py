@@ -425,6 +425,21 @@ def test_mega_builds_the_mori_kernel_next_to_its_own(mega_method):
 
 
 @pytest.mark.parametrize(
+    ("env", "quant"), [(None, "a8w4"), ("0", "a8w4"), ("1", "a4w4")]
+)
+def test_mega_quant_follows_the_a4w4_env(mega_method, monkeypatch, env, quant):
+    if env is None:
+        monkeypatch.delenv("ATOM_MEGA_A4W4", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_MEGA_A4W4", env)
+    mega_method.method.init_prepare_finalize(mega_method.layer)
+    mega_method.across_dp = (64, 64, 64, 64)
+    _apply(mega_method, 64)
+
+    assert [kwargs["quant"] for kwargs in mega_method.mega] == [quant]
+
+
+@pytest.mark.parametrize(
     ("across_dp", "mega"),
     [((64, 64, 64, 63), False), ((64, 64, 64, 64), True), ((256, 0, 0, 0), True)],
 )

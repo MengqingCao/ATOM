@@ -2734,14 +2734,15 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             model_dim=self.hidden_size,
             inter_dim=self.intermediate_size,
             mtpr=self.moe.max_num_tokens,
-            quant="a8w4",
+            quant="a4w4" if envs.ATOM_MEGA_A4W4 else "a8w4",
         )
 
     def mega_runs(self, layer: torch.nn.Module, rows: int) -> bool:
-        """Whether Mega, which quantizes activations to MXFP8, takes a step of
-        `rows` rows across the DP group: only where the standard method, on its
-        separated gate/up layout, would quantize them to MXFP4. Below that it
-        runs bf16 activations, and so does the fallback."""
+        """Whether Mega, which quantizes activations to MXFP8 (MXFP4 under
+        ATOM_MEGA_A4W4), takes a step of `rows` rows across the DP group: only
+        where the standard method, on its separated gate/up layout, would
+        quantize them to MXFP4. Below that it runs bf16 activations, and so
+        does the fallback."""
         from aiter.fused_moe import resolve_activation_dtype
 
         return (

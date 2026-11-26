@@ -88,7 +88,7 @@ drop() {
   $G release "$LEASE" --force --note "#35 driver: GPUs busy with a foreign unleased process ($1), nothing of ours ran; re-queuing elsewhere"
   : > $S/driver_lease; log "END released $LEASE on $NODE: foreign process"; bad="$bad $NODE"; LEASE=
 }
-log "CONFIG #35 ruling 7167528921, all arms: prefill KV CPU tier = Mooncake Store 2 TB = 1863 GiB host DRAM (MOONCAKE_STORE=1, owners 0:465:rdma4;0:465:rdma5;1:465:rdma6;1:465:rdma7, 930 GiB a NUMA node under the ~1017 GiB huge-page ceiling; ATOM_KV_OFFLOAD=mooncake_store via launcher; decode no tier); ruling 7164687062: decode DP session affinity off (no dp_sticky/--dp-aware/X-Session-ID; router policy random), AgentX warmup_requests_per_lane=1 (was 10), window 1200 s, warmup_grace_period 1800 s; watchdog agentx duration+${WD_MARGIN:-1800} s, gsm8k 3600 s"
+log "CONFIG #35 ruling 7183814426, all arms, P and D: --kv-cache-dtype nvfp4 --index-cache-dtype nvfp4 (was fp8/fp8; FP8 reference runs in harness/runs-fp8/), DSpark draft KV --spec-decode-kv-cache-dtype fp8 (as the FP8 runs; engine default under nvfp4 would be bf16); ruling 7167528921: prefill KV CPU tier = Mooncake Store 2 TB = 1863 GiB host DRAM (MOONCAKE_STORE=1, owners 0:465:rdma4;0:465:rdma5;1:465:rdma6;1:465:rdma7, 930 GiB a NUMA node under the ~1017 GiB huge-page ceiling; ATOM_KV_OFFLOAD=mooncake_store via launcher; decode no tier); ruling 7164687062: decode DP session affinity off (no dp_sticky/--dp-aware/X-Session-ID; router policy random), AgentX warmup_requests_per_lane=1 (was 10), window 1200 s, warmup_grace_period 1800 s; watchdog agentx duration+${WD_MARGIN:-1800} s, gsm8k 3600 s"
 grant
 
 yield() { $G mine | grep "$LEASE" | grep -q YIELD; }

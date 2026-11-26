@@ -1,5 +1,5 @@
---- a/bin/run_pd.sh	2026-11-25 03:39:18.102945859 +0000
-+++ b/bin/run_pd.sh	2026-11-26 03:59:56.093149354 +0000
+--- a/bin/run_pd.sh
++++ b/bin/run_pd.sh
 @@ -31,8 +31,9 @@
  BASE="${H}/runs"
  SNAP="${H}/src/${TAG}-${STAMP}"
@@ -12,6 +12,15 @@
  git -C "${TREE}" worktree add --detach "${SNAP}" "${snap_sha}" > /dev/null
  echo "snapshot ${snap_sha} of ${TREE} -> ${SNAP}"
  cd "${SNAP}"
+@@ -109,7 +110,7 @@
+ cell["env"]["decode"].pop("ATOM_M3_INDEXER_CP", None) if "ATOM_M3_INDEXER_CP=1" not in dec_env else None
+ if dec_kv:
+     cell["env"]["decode"]["DECODE_KV_TRANSFER_CONFIG"] = dec_kv
+-cell["display_topology"] = f"1P1D-{pf_arm}-{arm}-DSPARK7-FP8KV" + ("-GSM8K" if cell.get("run_eval") else "")
++cell["display_topology"] = f"1P1D-{pf_arm}-{arm}-DSPARK7-NVFP4KV" + ("-GSM8K" if cell.get("run_eval") else "")
+ cell["concurrency"] = [int(conc)]
+ cell["concurrency_x"] = str(conc)
+ cell["benchmark"]["benchmark_duration"] = int(dur)
 @@ -141,12 +142,12 @@
  fi
  { echo "tag=${TAG} decode_arm=${ARM} prefill_arm=${PREFILL_ARM} kind=${KIND} conc=${CONC} duration=${DUR} cell=${CELL}"
@@ -29,8 +38,8 @@
  SCRAPE_P=$!
  set +e
  bash .github/scripts/atomesh/pd_slurm_job.sh --spur-worker
---- a/bin/layer_breakdown.py	2026-11-25 03:39:17.560248315 +0000
-+++ b/bin/layer_breakdown.py	2026-11-25 07:58:23.640208444 +0000
+--- a/bin/layer_breakdown.py
++++ b/bin/layer_breakdown.py
 @@ -25,6 +25,8 @@
  # First match wins; order matters (comm before norms, MoE routing before top-k, ...).
  # Names from an arm A decode trace (aiter 9f3cba25e); arm B adds MoRI dispatch/combine.
@@ -78,3 +87,42 @@
          "queue_time_mean_s": r(sum(qs.values()) / sum(qc.values()), 2) if sum(qc.values()) else None,
          "stage_gpu_forward_busy": {k: r(v, 3) for k, v in sorted(busy.items())},
          "waiting_p50": pct(waiting, 50), "waiting_p90": pct(waiting, 90),
+--- a/cells/m31_decode_ab.yaml
++++ b/cells/m31_decode_ab.yaml
+@@ -71,7 +71,7 @@
+     server:
+       common_args:
+         trust_remote_code: true
+-        kv_cache_dtype: fp8
++        kv_cache_dtype: nvfp4
+         block_size: 128
+         enable_prefix_caching: true
+         gpu_memory_utilization: 0.9
+@@ -81,7 +81,8 @@
+         draft_model: "${ATOMESH_MODEL_ROOT}/amd/MiniMax-M3.1-Flash-Quark-MXFP4/dspark"
+         num_speculative_tokens: 7
+         spec_decode_acceptance_length: 4.04
+-        extra_args: "--index-cache-dtype fp8"
++        # ATOM#35 ruling 7183814426: NVFP4 KV + NVFP4 index (P and D); the DSpark draft KV stays FP8 as in the FP8 runs (engine default under nvfp4 is bf16)
++        extra_args: "--index-cache-dtype nvfp4 --spec-decode-kv-cache-dtype fp8"
+     service:
+       prefill:
+         cudagraph: "[1]"
+@@ -95,7 +96,7 @@
+         - &m31d_agentx
+           name: m31d-1p1d-agentx
+           topology: 1p1d
+-          display_topology: 1P1D-P-A-DSPARK7-FP8KV
++          display_topology: 1P1D-P-A-DSPARK7-NVFP4KV
+           pd_worker_layout: single_node
+           nodes: "${ATOMESH_1P1D_NODES}"
+           isl: [1048576]
+@@ -148,7 +149,7 @@
+         # GSM8K through P/D (real acceptance: the eval-only phase drops the forced AL).
+         - <<: *m31d_agentx
+           name: m31d-1p1d-gsm8k
+-          display_topology: 1P1D-P-A-DSPARK7-FP8KV-GSM8K
++          display_topology: 1P1D-P-A-DSPARK7-NVFP4KV-GSM8K
+           isl: [4096]
+           concurrency: [32]
+           run_eval: true

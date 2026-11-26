@@ -48,10 +48,14 @@ PY
 # aiperf --prefix-prompt-pool-size 1 gives every request the same prefix; dataset entries = 1 + measured requests,
 # so each tail is unique. Warmup: 1 request at concurrency 1 computes the prefix once (aiperf waits for it before the
 # profiling phase); then a closed loop at CONC with CONC x FIXED_REQ_MULT (5) measured requests.
+# FIXED_WINDOW=1 (owner's ruling 7195240774, the r2 runs): time-based instead, aiperf --benchmark-duration
+# (the run's DURATION_S, AIPERF_BENCHMARK_DURATION) with aiperf's own end of window: no new request after it, in-flight
+# ones get aiperf's default 30 s grace period and count if they finish in it. CONC x 60 dataset entries (unique tails;
+# c64 ran 2.5 req/s, ~1500 in 600 s) so the closed loop never runs short or reuses a tail.
 if [[ "${KIND}" == fixed ]]; then
-  python3 - .github/scripts/atomesh/pd_server_atom.sh "${FIXED_PREFIX:-130048}" "${FIXED_TAIL:-1024}" "${FIXED_OSL:-2048}" "${FIXED_REQ_MULT:-5}" <<'PY'
+  python3 - .github/scripts/atomesh/pd_server_atom.sh "${FIXED_PREFIX:-130048}" "${FIXED_TAIL:-1024}" "${FIXED_OSL:-2048}" "${FIXED_REQ_MULT:-5}" "${FIXED_WINDOW:-}" <<'PY'
 import sys
-p, pre, isl, osl, mult = sys.argv[1:]
+p, pre, isl, osl, mult, window = sys.argv[1:]
 s = open(p).read()
 a = '      "${AGENTX_VENV}/bin/agentx" profile \\\n'
 b = '      --public-dataset "${AIPERF_PUBLIC_DATASET}" \\\n'
@@ -60,10 +64,13 @@ assert s.count(a) == 1 and s.count(b) == 1 and i < j, "agentx profile call in pd
 k = '      "${server_metrics_args[@]}" \\\n      --output-artifact-dir "${out_dir}" \\\n'
 assert k in s[i:j], "aiperf output args in pd_server_atom.sh changed"
 n = f"$(( conc * {mult} ))"
+stop = f'--request-count "{n}"'
+if window:
+    n, stop = "$(( conc * 60 ))", '--benchmark-duration "${AIPERF_BENCHMARK_DURATION}"'
 new = ('      "${AGENTX_VENV}/bin/aiperf" profile \\\n'
        '      --url "http://127.0.0.1:${ROUTER_PORT}" --endpoint /v1/chat/completions --endpoint-type chat --streaming \\\n'
        '      --model "${MODEL_PATH}" --tokenizer "${MODEL_PATH}" --tokenizer-trust-remote-code \\\n'
-       f'      --concurrency "${{conc}}" --warmup-request-count 1 --warmup-concurrency 1 --request-count "{n}" \\\n'
+       f'      --concurrency "${{conc}}" --warmup-request-count 1 --warmup-concurrency 1 {stop} \\\n'
        f'      --num-dataset-entries "$(( 1 + {n} ))" --random-seed 42 \\\n'
        f'      --prefix-prompt-pool-size 1 --prefix-prompt-length {pre} \\\n'
        f'      --isl {isl} --isl-stddev 0 --osl {osl} --osl-stddev 0 --extra-inputs ignore_eos:true \\\n'

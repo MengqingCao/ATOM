@@ -149,3 +149,10 @@ run() {
 for spec in "B2-c64-r1 B2 fixed 64 1200" "B2-c45-r1b B2 fixed 45 1200"; do
   run "$spec" || { why="${spec%% *} invalid: diagnose"; exit 1; }
 done
+# Owner's ruling 7195240774, appended (never rewritten: the running driver reads on from here) after the queue above:
+# a second round on the same lease, one spec a line from extras.txt, read once the loop above is done.
+mapfile -t extra < <(grep -v '^[[:space:]]*\(#\|$\)' "$D/extras.txt" 2>/dev/null)
+((${#extra[@]})) && log "EXTRAS ${#extra[@]} runs from extras.txt (ruling 7195240774, aiperf 600 s window): ${extra[*]%% *}"
+for spec in "${extra[@]}"; do
+  run "$spec" || { why="${spec%% *} invalid: diagnose"; exit 1; }
+done

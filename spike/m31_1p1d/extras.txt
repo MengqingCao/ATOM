@@ -1,0 +1,8 @@
+# Owner's ruling 7195240774: second round on the driver's lease after its in-memory queue (driver.sh's tail reads this
+# once, when B2-c45-r1b is done). Field 6 "window": aiperf time-based, --benchmark-duration 600 (ov_spike.sh FIXED_WINDOW).
+A-c45-r2 A fixed 45 600 window
+B1-c45-r2 B1 fixed 45 600 window
+B2-c45-r2 B2 fixed 45 600 window
+A-c64-r2 A fixed 64 600 window
+B1-c64-r2 B1 fixed 64 600 window
+B2-c64-r2 B2 fixed 64 600 window

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # On the node, in the background: 1P1D runs one after another.  Usage: batch.sh "TAG ARM KIND [CONC] [DUR]" ...
-# TRACE=1 in a spec's env (prefix "TRACE=1:TAG ...") traces it. A gsm8k run keeps the decode server's last
+# A 6th field "window" ("TAG ARM fixed CONC DUR window") runs the fixed cell time-based: aiperf --benchmark-duration DUR
+# (ov_spike.sh FIXED_WINDOW). TRACE=1 in a spec's env (prefix "TRACE=1:TAG ...") traces it. A gsm8k run keeps the decode server's last
 # /debug/mtp_stats (real acceptance) in <S>/acc/mtp_<TAG>.json; a traced gsm8k run also takes a 2-s decode
 # profiler window once 20,000 draft tokens are in (the launcher opens windows only in AgentX runs).
 S=/share_nfs/mengqing/code/tmp/m31-decode-dep4/81; D=$(dirname "$(readlink -f "$0")")
@@ -24,7 +25,7 @@ print(next((s for s in range(0, 1801, 100)
     PORT=$mp bash $D/poll_mtp.sh $S/acc/mtp_$tag.json & pids+=($!)
     [[ -n $tr ]] && { PORT=$mp bash $D/gsm_profile.sh & pids+=($!); }
   fi
-  TRACE=$tr EVAL_LIMIT=200 bash $D/run_1p1d.sh "$@" > $S/logs/$tag.log 2>&1
+  FIXED_WINDOW=$([[ ${6:-} == window ]] && echo 1) TRACE=$tr EVAL_LIMIT=200 bash $D/run_1p1d.sh "$@" > $S/logs/$tag.log 2>&1
   echo "$(date -u +%T) $tag rc=$?"
   kill "${pids[@]}" 2>/dev/null; wait 2>/dev/null
 done

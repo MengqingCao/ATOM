@@ -216,7 +216,7 @@ Summed across DP ranks by `LLMEngine.get_metrics_statistics()`.
 
 | Metric | Type / unit | Definition |
 | --- | --- | --- |
-| `atom:dp_affinity_new` | Counter | New sticky DP sessions assigned to a load-aware cache owner. |
+| `atom:dp_affinity_new` | Counter | New sticky DP sessions assigned a cache owner: the least-loaded rank, or under `ATOM_DP_LEAST_SESSIONS` the rank with the fewest live sessions. |
 | `atom:dp_affinity_owner_hit` | Counter | Requests routed to an existing session cache owner. |
 | `atom:dp_affinity_spill` | Counter | Existing sessions moved off their cache owner; strict affinity keeps this at 0. |
 | `atom:dp_affinity_parent_ignored` | Counter | New child sessions placed independently instead of inheriting a parent owner. |
@@ -233,7 +233,7 @@ Summed across DP ranks by `LLMEngine.get_metrics_statistics()`.
 | `atom:dp_requests_routed` | Counter, requests | Cumulative requests per rank. Label: `rank`. |
 | `atom:dp_inflight_requests` | Gauge, requests | In-flight requests charged to each rank. Label: `rank`. |
 | `atom:dp_queued_prefill_tokens` | Gauge, tokens | Estimated uncached prefill-token debt per rank; sticky follow-up turns charge only positive prompt growth. Label: `rank`. |
-| `atom:dp_sessions` | Gauge, sessions | Sticky sessions owned by each rank. Label: `rank`. |
+| `atom:dp_sessions` | Gauge, sessions | Sticky sessions owned by each rank; under `ATOM_DP_LEAST_SESSIONS`, only live ones (routed within `ATOM_DP_SESSION_IDLE_S`), the count that placement uses. Label: `rank`. |
 
 ### LMCache offload
 

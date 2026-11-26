@@ -311,6 +311,8 @@ class CoreManager:
     _backlog = None
     # No session moves unless a pool-sharing connector sets a margin.
     _session_migrate_margin = None
+    # Least-session placement's idle window in seconds; None leaves it off.
+    _dp_session_idle_s = None
     _bp_offline_batch = False
     _bp_dispatch_paused = False
     _input_send_lock = Lock()
@@ -412,6 +414,18 @@ class CoreManager:
         # is built after env/args are finalized), not a runtime-tunable knob.
         self._dp_lb_req_equiv = envs.ATOM_DP_LB_REQ_EQUIV
         self._dp_session_affinity_enabled = envs.ATOM_DP_SESSION_AFFINITY
+        least_sessions = envs.ATOM_DP_LEAST_SESSIONS
+        if least_sessions and not self._dp_session_affinity_enabled:
+            logger.warning(
+                "%s: ATOM_DP_LEAST_SESSIONS has no effect without "
+                "ATOM_DP_SESSION_AFFINITY=1",
+                label,
+            )
+        self._dp_session_idle_s = (
+            envs.ATOM_DP_SESSION_IDLE_S
+            if least_sessions and self._dp_session_affinity_enabled
+            else None
+        )
         # Session id -> rank whose local prefix cache owns the session. Owners
         # are immutable for the lifetime of the process: moving one turn to a
         # light rank discards the dominant optimization in agentic workloads,
@@ -1755,8 +1769,10 @@ class CoreManager:
             if not isinstance(policy, SessionPolicy):
                 # Moving a session is worth it only where its history moves
                 # along: the ranks share their pools, and a margin was set.
+                # Least-session placement never moves an established session.
                 margin = self._session_migrate_margin
-                migrate = margin is not None
+                idle_s = self._dp_session_idle_s
+                migrate = margin is not None and idle_s is None
                 policy = SessionPolicy(
                     self._select_dp_rank_locked,
                     self._select_new_session_rank_locked,
@@ -1766,6 +1782,7 @@ class CoreManager:
                     self._record_ignored_parent,
                     rank_reqs=(lambda: self._rank_reqs) if migrate else None,
                     margin=margin if migrate else 0.1,
+                    idle_s=idle_s,
                 )
         elif policy is None or type(policy) is not LoadPolicy:
             policy = LoadPolicy(self._select_dp_rank_locked)
@@ -1788,10 +1805,14 @@ class CoreManager:
     def get_dp_router_statistics(self) -> dict:
         """Return a consistent, non-mutating snapshot of DP routing state."""
         with self._lb_lock:
-            sessions_per_rank = [0] * self._routable_engine_count
-            for rank in self._dp_session_owners.values():
-                if 0 <= rank < self._routable_engine_count:
-                    sessions_per_rank[rank] += 1
+            if self._dp_session_idle_s is not None:
+                # Least-session placement: the live count it places by.
+                sessions_per_rank = self._get_dp_policy().live_counts()
+            else:
+                sessions_per_rank = [0] * self._routable_engine_count
+                for rank in self._dp_session_owners.values():
+                    if 0 <= rank < self._routable_engine_count:
+                        sessions_per_rank[rank] += 1
             snapshot = {
                 "enabled": self._routable_engine_count > 1,
                 **self._dp_route_counters,

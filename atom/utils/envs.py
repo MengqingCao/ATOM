@@ -284,6 +284,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SESSION_AFFINITY": lambda: (
         os.getenv("ATOM_DP_SESSION_AFFINITY", "0").lower() in {"1", "true", "yes", "on"}
     ),
+    # With session affinity on, place a new session on the rank holding the
+    # fewest live sessions (lowest index on a tie) instead of the lightest one;
+    # established sessions never move.
+    "ATOM_DP_LEAST_SESSIONS": lambda: _flag_env("ATOM_DP_LEAST_SESSIONS"),
+    # Least-session placement: a session counts as live while its last request
+    # was routed at most this many seconds ago.
+    "ATOM_DP_SESSION_IDLE_S": lambda: _positive_float_env(
+        "ATOM_DP_SESSION_IDLE_S", "7200"
+    ),
     # --- DP prefill cost balancing (DP attention with more than one rank) ---
     # Under DP attention every rank prefills in the same lockstep step and the
     # step lasts as long as the slowest rank. With the same token budget, a rank

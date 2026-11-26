@@ -2609,7 +2609,9 @@ class Scheduler:
             # A ready head blocked on room keeps its place past the admission
             # deadline; an expired request behind it is answered now.
             for seq in [
-                s for s in self.waiting if s.leave_reason == CHUNKED_ADMISSION_TIMEOUT
+                s
+                for s in self.waiting
+                if getattr(s, "leave_reason", None) == CHUNKED_ADMISSION_TIMEOUT
             ]:
                 self.waiting.remove(seq)
                 self._finish_rejected_waiting(seq)
@@ -3751,7 +3753,7 @@ class Scheduler:
         A preempted request may already have run before this rejection.
         With no `reason`, a reason the connector already set is kept.
         """
-        reason = reason or seq.leave_reason or "aborted"
+        reason = reason or getattr(seq, "leave_reason", None) or "aborted"
         self._early_load.note_gone(seq.id, aborted=True)
         if self.pd_admission is not None:
             self.pd_admission.cancel(seq)

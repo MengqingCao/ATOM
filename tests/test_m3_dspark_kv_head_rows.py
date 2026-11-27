@@ -67,7 +67,7 @@ def _bind_methods():
         "_block_meta_kernel": {(2,): _kernel},
     }
     module = ast.Module(body=defs, type_ignores=[])
-    exec(compile(module, str(SOURCE), "exec"), namespace)
+    exec(compile(module, str(SOURCE), "exec"), namespace)  # noqa: S102 - our own source
     for d in defs:
         setattr(_Draft, d.name, namespace[d.name])
 

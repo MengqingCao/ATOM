@@ -96,7 +96,8 @@ LAUNCHER_FLAGS = {"--model", "--tensor-parallel-size", "-tp", "--pipeline-parall
                   "--kv-cache-dtype", "--block-size", "--max-model-len", "--kv-transfer-config", "--method",
                   "--draft-model", "--num-speculative-tokens", "--spec-decode-acceptance-length", "--host",
                   "--port", "--server-port"}
-NO_VALUE = {"--trust-remote-code", "--enable-prefix-caching", "--no-enable_prefix_caching", "--enforce-eager"}
+NO_VALUE = {"--trust-remote-code", "--enable-prefix-caching", "--no-enable_prefix_caching", "--enforce-eager",
+            "--enable-dp-attention", "--enable-expert-parallel"}  # #108: DEP4 decodes
 CAPACITY = {"--max-num-seqs": "seqs", "--max-num-batched-tokens": "mnbt", "--gpu-memory-utilization": "mem",
             "--cudagraph-capture-sizes": "cg"}
 

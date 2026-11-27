@@ -148,6 +148,11 @@ start_router
         self.assertEqual(args[args.index("--policy") + 1], "dp_sticky")
         self.assertIn("--dp-aware", args)
 
+    def test_explicit_round_robin_survives_agentic_dpa(self):
+        args = self.router_args(self.cells[0], policy="round_robin")
+        self.assertEqual(args[args.index("--policy") + 1], "round_robin")
+        self.assertIn("--dp-aware", args)
+
     def test_non_agentic_policy_is_preserved(self):
         args = self.router_args(self.cells[0], policy="random", kind="random")
         self.assertEqual(args[args.index("--policy") + 1], "random")

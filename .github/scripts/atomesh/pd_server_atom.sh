@@ -2270,7 +2270,8 @@ start_router() {
   local -a router_prefill_policy_args=()
   if is_agentic_dpa; then
     # Respect explicit cache-aware routing for DPA workloads.
-    if [[ "${router_policy}" != "cache_aware" ]]; then
+    # Respect explicit round_robin too (MengqingCao/ATOM#108's decode routing A/B).
+    if [[ "${router_policy}" != "cache_aware" && "${router_policy}" != "round_robin" ]]; then
       router_policy="dp_sticky"
     fi
     router_dp_aware_args=(--dp-aware)

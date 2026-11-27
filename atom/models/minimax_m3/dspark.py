@@ -1371,15 +1371,6 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         self._start16 = torch.zeros(max_bs * T, dtype=torch.int64, device=device)
         self._ctx_eff = torch.zeros(max_bs, dtype=torch.int32, device=device)
-        H = self.kv_heads_per_rank
-        if H > 1:
-            # One row per (block row, KV head), as `sparse_pa_per_row` reads them.
-            rows_kv = max_bs * T * H
-            self._bt16_rows_kv = torch.zeros(
-                rows_kv, P, dtype=torch.int32, device=device
-            )
-            self._ctx_rows_kv = torch.zeros(rows_kv, dtype=torch.int32, device=device)
-            self._kv_heads = torch.arange(H, dtype=torch.int32, device=device)
 
     def prepare_paged_block(
         self,
@@ -1440,18 +1431,36 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             self._bt16_rows[:rows],
             self._ctx_rows[:rows],
         )
-        tables, lens = self._bt16_rows[:rows], self._ctx_rows[:rows]
-        H = self.kv_heads_per_rank
-        if H > 1:
-            # Page p of KV head h is p * H + h in the KV-head-collapsed cache view.
-            kv_tables = self._bt16_rows_kv[: rows * H].view(rows, H, P)
-            kv_tables.copy_(tables.unsqueeze(1).expand(rows, H, P))
-            kv_tables.mul_(H).add_(self._kv_heads.view(1, H, 1))
-            kv_lens = self._ctx_rows_kv[: rows * H].view(rows, H)
-            kv_lens.copy_(lens.unsqueeze(1).expand(rows, H))
-            tables, lens = kv_tables.view(rows * H, P), kv_lens.view(rows * H)
+        tables, lens = self._kv_head_rows(
+            self._bt16_rows[:rows], self._ctx_rows[:rows], self.max_num_seqs * T
+        )
         attn_metadata.dspark_bt16_rows = tables
         attn_metadata.dspark_ctx_rows = lens
+
+    def _kv_head_rows(self, tables: torch.Tensor, lens: torch.Tensor, max_rows: int):
+        """The block rows' page tables and lengths as `sparse_pa_per_row` reads
+        them: with several KV heads a rank (attention TP1, e.g. under DP
+        attention), one row per (block row, KV head), page p of head h at
+        p * H + h in the KV-head-collapsed cache view. Its buffers are made on
+        the first call (the warmup, ahead of any capture) and only sliced after."""
+        H = self.kv_heads_per_rank
+        if H == 1:
+            return tables, lens
+        rows, P = tables.shape
+        buf = getattr(self, "_kv_rows_buf", None)
+        if buf is None or buf[0].shape[1] != P or buf[1].shape[0] < max_rows * H:
+            n = max_rows * H
+            buf = self._kv_rows_buf = (
+                torch.zeros(n, P, dtype=torch.int32, device=tables.device),
+                torch.zeros(n, dtype=torch.int32, device=tables.device),
+                torch.arange(H, dtype=torch.int32, device=tables.device),
+            )
+        kv_tables = buf[0][: rows * H].view(rows, H, P)
+        kv_tables.copy_(tables.unsqueeze(1).expand(rows, H, P))
+        kv_tables.mul_(H).add_(buf[2].view(1, H, 1))
+        kv_lens = buf[1][: rows * H].view(rows, H)
+        kv_lens.copy_(lens.unsqueeze(1).expand(rows, H))
+        return kv_tables.view(rows * H, P), kv_lens.view(rows * H)
 
     def _sharded_markov_sample(self) -> bool:
         """Whether the block is sampled off this rank's vocab shard: the ranks
@@ -1577,6 +1586,9 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             PAD_CTX=pad_ctx_len, STAGE=stage is not None, POS_MAJOR=self._pos_major,
             num_warps=4,
         )  # fmt: skip
+        # #109: the generic path's KV-head rows, which DP attention (4 KV heads a
+        # rank) reads; without them every draft row attends the wrong pages.
+        rows_bt, rows_len = self._kv_head_rows(rows_bt, rows_len, self.max_num_seqs * T)
         attn_metadata.dspark_bt16_rows = rows_bt
         attn_metadata.dspark_ctx_rows = rows_len
 

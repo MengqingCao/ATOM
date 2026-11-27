@@ -216,11 +216,12 @@ def get_or_build_mega_moe(
         if rank == 0:
             logger.info(
                 "[MEGA-CAPACITY] built capacity=%d, ep=%d, experts/rank=%d, "
-                "act=%s, small-input routes (bf16 wire)=%s",
+                "act=%s, quant=%s, small-input routes (bf16 wire)=%s",
                 mtpr,
                 world_size,
                 experts // world_size,
                 act,
+                quant,
                 m.atom_routes,
             )
 

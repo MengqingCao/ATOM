@@ -462,6 +462,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MEGA_DECODE_COMBINE_QUANT": lambda: (
         os.getenv("ATOM_MEGA_DECODE_COMBINE_QUANT", "0") == "1"
     ),
+    # MegaMoE quantizes activations to MXFP4 (a4w4) rather than MXFP8 (a8w4).
+    "ATOM_MEGA_A4W4": lambda: os.getenv("ATOM_MEGA_A4W4", "0") == "1",
     # MegaMoE stage 1 (aiter stage1_fused), i.e. which dispatch MegaMoEGfx1250
     # runs. 1: the compact plan -- routing/layout planning fused with a flydsl
     # TDM dispatch that writes the grouped GEMM's per-expert rows directly.

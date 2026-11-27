@@ -19,9 +19,11 @@ docker exec -u 0 $C bash -c 'R=/app/aiter-test/aiter/ops/flydsl/kernels; rm -rf 
 # docker commit keeps the container's `sleep infinity`: restore the base's entrypoint and cmd.
 EP=$(docker image inspect -f '{{json .Config.Entrypoint}}' "$BASE"); CMD=$(docker image inspect -f '{{json .Config.Cmd}}' "$BASE")
 [[ $EP == null ]] && EP='[]'; [[ $CMD == null ]] && CMD='[]'
-docker commit -c "ENTRYPOINT $EP" -c "CMD $CMD" -c "LABEL com.amd.m31agx.mega_moe=a40489a9e" $C "$IMAGE" >/dev/null
+docker commit -c "LABEL com.amd.m31agx.mega_moe=a40489a9e" $C "$IMAGE" >/dev/null
 docker rm -f $C >/dev/null
+# `docker commit -c 'ENTRYPOINT []'` does not clear an entrypoint; a build does.
+printf 'FROM %s\nENTRYPOINT %s\nCMD %s\n' "$IMAGE" "$EP" "$CMD" | docker build -q -t "$IMAGE" - >/dev/null
 docker run --rm --network none --entrypoint python3 "$IMAGE" -c \
   'import aiter.ops.flydsl.kernels.mega_moe.mega_moe_config as m; print("mega a4w4 fused:", hasattr(m, "A4W4_FUSED_LAYOUTS"))' 2>&1 | tail -1
-docker image inspect -f '{{.Id}} {{index .Config.Labels "com.amd.m31agx.aiter.commit"}}' "$IMAGE"
+docker image inspect -f '{{.Id}} {{index .Config.Labels "com.amd.m31agx.aiter.commit"}}' "$IMAGE"; docker run --rm --network none "$IMAGE" bash -c 'echo entrypoint ok'
 REMOTE

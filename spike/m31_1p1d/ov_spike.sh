@@ -26,7 +26,7 @@ export AIPERF_WARMUP_REQUESTS_PER_LANE=1
 # 832 GiB may not register on an ionic NIC; 930 GiB a NUMA node stays under the ~1017 GiB a node compacts to huge pages
 # (2 TiB = 1024 GiB a node failed rc=134 on g48 and g40).
 export ATOMESH_PREFILL_ENV_MOONCAKE_STORE=1
-export ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS="0:465:rdma4;0:465:rdma5;1:465:rdma6;1:465:rdma7"
+export ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS="0:465:rdma4;1:465:rdma6"
 # Ports: another process on the node can hold a launcher default (29600 on g53, run 20261126035137). batch.sh picks
 # ATOMESH_PORT_SHIFT so every default port (and its eval-phase +1000 twin) is free; the launcher shifts all of them
 # (servers, router, Prometheus, handshake, P and D torch dist master/base, Mooncake master/metadata/metrics/owners)

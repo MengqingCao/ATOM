@@ -73,8 +73,8 @@ grant() {
     # of each into huge pages. Page cache does not count: reclaiming 1200 GiB of it through compaction overran 600 s on g40
     # (run 20261126032634), and dropping the node's shared cache would hurt other users. Need MemFree >= 988 on each node.
     mem=$(ssh "$HOST" 'for n in 0 1; do awk "/MemFree/{print int(\$4/1048576)}" /sys/devices/system/node/node$n/meminfo; done' | paste -sd' ')
-    log "MEM $NODE free GiB per NUMA node: ${mem:-?} (Store compacts 988 each)"
-    for m in ${mem:-0}; do ((m >= 988)) || { drop "host memory short for the 2 TB Store (MemFree GiB per NUMA: $mem, page cache not counted)"; continue 2; }; done
+    log "MEM $NODE free GiB per NUMA node: ${mem:-?} (Store compacts 494 each)"
+    for m in ${mem:-0}; do ((m >= 494)) || { drop "host memory short for the 930 GiB Store (MemFree GiB per NUMA: $mem, page cache not counted)"; continue 2; }; done
     who=$(foreign | paste -sd';'); [[ -z $who ]] && return 0
     drop "$who"
   done

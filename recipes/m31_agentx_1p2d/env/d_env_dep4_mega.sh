@@ -15,6 +15,11 @@ unset ${_drop}
 _keep=()
 for _n in "${D_ENV_NAMES[@]}"; do [[ "${_drop}" == *" ${_n}"[[:space:]]* ]] || _keep+=("${_n}"); done
 export ATOM_MEGA_A4W4=1
-D_ENV_NAMES=("${_keep[@]}" ATOM_MEGA_A4W4)
+# MengqingCao/ATOM#109: ganyi's c17 DSpark decode features default on in this tree (verify head, draft context in the
+# decode graph, fused draft metadata, sharded draft fc) and C2's tree had none of them. With them on, the first real
+# decode step on one DP rank never completes beside its peers' dummy steps (decode GPUs spin, every rank stalls).
+export ATOM_M3_VERIFY_HEAD=0 ATOM_M3_DRAFT_CTX_IN_GRAPH=0 ATOM_M3_DRAFT_FUSED_META=0 ATOM_M3_DRAFT_FC_SHARDED=0
+D_ENV_NAMES=("${_keep[@]}" ATOM_MEGA_A4W4
+  ATOM_M3_VERIFY_HEAD ATOM_M3_DRAFT_CTX_IN_GRAPH ATOM_M3_DRAFT_FUSED_META ATOM_M3_DRAFT_FC_SHARDED)
 D_SERVER_ARGS+=(--enable-dp-attention --enable-expert-parallel --moe-backend mega)
 unset _drop _keep _n

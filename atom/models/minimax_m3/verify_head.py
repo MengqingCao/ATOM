@@ -35,9 +35,9 @@ import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_ops.sampler import SAMPLER_EPS
+from atom.model_ops.tile_argmax import argmax_lowest_id, argmax_of_tiles
 from atom.model_ops.verify_head import VerifyHead
 from atom.model_ops.verify_ids import VerifyOutput
-from atom.model_ops.tile_argmax import argmax_lowest_id, argmax_of_tiles
 from atom.models.minimax_m3.packed_argmax import (
     EMPTY,
     pack_max_id,
@@ -367,7 +367,16 @@ class M3VerifyHead:
         from atom.models.minimax_m3.dspark import local_logits
 
         temps = self.runner.forward_vars["temperatures"].gpu
-        logits = local_logits(self.lm.lm_head, hidden_states)  # [rows, V / tp]
+        head = self.lm.lm_head
+        if head._can_use_dp_sharded_head(ctx):
+            # Pure DP: a peer with no request takes this step's logits through
+            # the DP-sharded collective (`ParallelLMHead.forward`), so this rank
+            # must enter it too; it returns this rank's rows over the whole vocab.
+            logits = head._dp_sharded_logits(
+                hidden_states, envs.ATOM_DP_LM_HEAD_MODE
+            )
+        else:
+            logits = local_logits(head, hidden_states)  # [rows, V / tp]
         return self.verify(logits, ids, temps, self._cond_rates())
 
     def verify(self, logits, ids, temps, cond):

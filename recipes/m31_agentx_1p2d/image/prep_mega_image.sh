@@ -15,8 +15,9 @@ BASE=$1 TAR=$2 MEGA=$3 IMAGE=$4 C=mengqing-108-prep
 docker image inspect "$BASE" >/dev/null 2>&1 || docker load -i "$TAR"
 docker rm -f $C >/dev/null 2>&1 || true
 docker run -d --name $C --network none -v "$MEGA":/mega:ro --entrypoint sleep "$BASE" infinity >/dev/null
-docker exec -u 0 $C bash -c 'R=/app/aiter-test/aiter/ops/flydsl/kernels; rm -rf $R/mega_moe && cp -r /mega $R/mega_moe; chmod 1777 /tmp/aiter_configs; chmod a+rw /tmp/aiter_configs/*'
-# /tmp/aiter_configs is root-owned in the base; the launcher's containers run as the user (no tmpdir.sh needed).
+docker exec -u 0 $C bash -c 'R=/app/aiter-test/aiter/ops/flydsl/kernels; rm -rf $R/mega_moe && cp -r /mega $R/mega_moe; chmod 0777 /tmp/aiter_configs; chmod a+rw /tmp/aiter_configs/*'
+# /tmp/aiter_configs is root-owned in the base and aiter renames its merged CSVs over those files: the launcher's
+# containers run as the user, so the directory must be writable without the sticky bit (no tmpdir.sh needed).
 # docker commit keeps the container's `sleep infinity`: restore the base's entrypoint and cmd.
 EP=$(docker image inspect -f '{{json .Config.Entrypoint}}' "$BASE"); CMD=$(docker image inspect -f '{{json .Config.Cmd}}' "$BASE")
 [[ $EP == null ]] && EP='[]'; [[ $CMD == null ]] && CMD='[]'

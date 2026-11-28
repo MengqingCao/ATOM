@@ -2295,6 +2295,17 @@ start_router() {
     )
     router_rank_mapping_args=(--atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}")
   fi
+  # ROUTER_KV_EVENTS=1: follow each worker's KV events (/kv_event_sources); the
+  # workers need ATOM_KV_EVENTS_ENABLE=1 and endpoints that do not collide.
+  # shortcut: the router takes one admin port for every master, so only pool 0's
+  # metrics port is readable at /kv_storage/sources; cache_aware does not use it.
+  local -a router_kv_events_args=()
+  if [[ "${ROUTER_KV_EVENTS:-0}" == "1" ]]; then
+    router_kv_events_args=(
+      --kv-events
+      --mooncake-admin-port "$(mooncake_pool_port "${ATOMESH_MOONCAKE_METRICS_PORT}" 0)"
+    )
+  fi
   local -a router_cmd=(
     "${mesh_binary}" launch
     --host 0.0.0.0
@@ -2306,6 +2317,7 @@ start_router() {
     "${router_prefill_policy_args[@]}"
     "${router_rank_mapping_args[@]}"
     "${router_dp_aware_args[@]}"
+    "${router_kv_events_args[@]}"
     --backend atom
     --log-level info
     --disable-circuit-breaker

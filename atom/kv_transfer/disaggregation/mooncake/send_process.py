@@ -368,6 +368,19 @@ def _connector_class():
                 raise RuntimeError(f"the stage never reported {req_id}'s KV complete")
             return self._ready_event
 
+        def _block_plan(self, request_data, num_consumer_regions, req_id):
+            """A whole-block destination (a TP1 decode, such as a DEP rank's
+            attention) as an identity head cut, so its blocks go out through
+            staging too: the KV is registered with no NIC here."""
+            plan = super()._block_plan(request_data, num_consumer_regions, req_id)
+            if plan.cuts is not None or request_data.get("consumer_dcp_size", 1) > 1:
+                return plan
+            whole = [
+                (n, np.array([[0, 0, n]]), mc.GatherLayout(n, n, ((0, n),)))
+                for n in self._per_block_bytes_list
+            ]
+            return mc._UnitPlan(plan.cmap, whole, plan.num_consumer_regions)
+
         def _rdma_write(
             self, target, src_addrs, dst_addrs, sizes, req_id, label, **kwargs
         ):

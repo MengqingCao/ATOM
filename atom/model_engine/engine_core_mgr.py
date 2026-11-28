@@ -69,6 +69,7 @@ from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
 from atom.structured_output import is_structured
 from atom.utils import (
+    dp_balance_log,
     envs,
     get_open_zmq_inproc_path,
     get_open_zmq_ipc_path,
@@ -300,6 +301,7 @@ def _add_frame(seqs: list[Sequence]) -> bytes:
 
 
 class CoreManager:
+    _dpb = None  # dp_balance_log JsonlLog under ATOM_DP_BALANCE_LOG
     # Class-level defaults so bare instances built via ``__new__`` (the DP
     # load-balance unit tests) and any subclass that skips ``_init_shared_state``
     # still have working backpressure state. Real instances override
@@ -405,6 +407,7 @@ class CoreManager:
         # "prefix_spread" (validated at the CLI by argparse
         # choices=DP_LB_STRATEGIES).
         self._dp_lb_strategy = config.dp_load_balance
+        self._dpb = dp_balance_log.open_log("mgr", dp_balance_log.MGR_FIELDS, config)
         # Token-equivalent weight of one in-flight request for "least_tokens".
         # Read once here: this is a construction-time config value (CoreManager
         # is built after env/args are finalized), not a runtime-tunable knob.
@@ -1345,6 +1348,13 @@ class CoreManager:
             if track_load:
                 reqs_snapshot = list(self._rank_reqs)
                 tokens_snapshot = list(self._rank_tokens)
+        if self._dpb is not None:
+            t = time.monotonic()
+            for rank, rank_seqs in enumerate(dp_seqs):
+                for seq in rank_seqs:
+                    self._dpb.row([round(t, 6), seq.id, rank,
+                                   int(getattr(seq, "num_prompt_tokens", 0) or 0),
+                                   reqs_snapshot])  # fmt: skip
 
         # Track which ranks were actually handed off, plus a compact per-rank
         # delta ("rankR:Nreq/Ttok") for the single summary log after the loop. If

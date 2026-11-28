@@ -47,6 +47,7 @@ from atom.utils import (
     make_zmq_socket,
     set_process_title,
 )
+from atom.utils import dp_balance_log
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -127,6 +128,7 @@ class EngineCore:
     # timed step; set per engine in __init__
     _sched_timer = None
     _st_last_end = None
+    _dpb = None  # dp_balance_log.EngineStepLog, DP ranks under ATOM_DP_BALANCE_LOG
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
@@ -860,6 +862,13 @@ class EngineCore:
                     "forward", scheduled_batch, wait_out=True
                 )
             finally:
+                dpb = getattr(self, "_dpb", None)
+                if dpb is not None:
+                    dpb.fwd = (
+                        time.monotonic() - self._step_started,
+                        scheduled_batch.total_tokens_num,
+                        scheduled_batch.total_seqs_num,
+                    )
                 self._step_started = None
             if st is not None:
                 t3 = time.perf_counter()
@@ -1319,6 +1328,10 @@ class DPEngineCoreProc(EngineCore):
         self._init_prefill_delayer(config, self.dp_group)
         # `share_cache` routing reads each rank's own prefill backlog.
         self._report_backlog = config.dp_load_balance == "share_cache"
+        log = dp_balance_log.open_log(
+            "engine", dp_balance_log.ENGINE_FIELDS, config, self.dp_rank
+        )
+        self._dpb = None if log is None else dp_balance_log.EngineStepLog(log)
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
@@ -1356,6 +1369,7 @@ class DPEngineCoreProc(EngineCore):
             interval = self._validate_dp_sync_interval(envs.ATOM_DP_SYNC_INTERVAL)
             # Interval 1 syncs every round, as on main: no gate.
             gate = DPSyncGate(interval) if interval > 1 else None
+            dpb = getattr(self, "_dpb", None)
             while True:
                 sync_now = gate is None or gate.should_sync()
                 if sync_now:
@@ -1380,10 +1394,13 @@ class DPEngineCoreProc(EngineCore):
 
                 # MAX-reduced: one held rank holds every rank of the group, so
                 # their forwards stay paired.
+                sync_dt = None
                 if sync_now:
+                    t_sync = time.monotonic()
                     global_has_unfinished, global_shutdown, global_held = (
                         self._sync_dp_state(local_unfinished, shutdown, local_held)
                     )
+                    sync_dt = time.monotonic() - t_sync
                     if gate is not None:
                         gate.synced(global_has_unfinished, global_shutdown, global_held)
                 else:
@@ -1422,9 +1439,12 @@ class DPEngineCoreProc(EngineCore):
                     continue
 
                 self.scheduler.engine_stats.note_busy(now)
+                t_step = time.monotonic()
                 executed = self._process_engine_step()
                 if not executed:
                     self._execute_dummy_batch()
+                if dpb is not None:
+                    dpb.step(t_step, time.monotonic(), executed, sync_dt, self.scheduler)
                 # After the pair, so the idle rank's dummy counts too: that is
                 # what keeps every rank's step number equal. See `bump_step`.
                 self.scheduler.engine_stats.bump_step()

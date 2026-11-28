@@ -109,7 +109,7 @@ from atom.quantization.quark.utils import (
     dequantize_nvfp4,
     quant_weight_online,
 )
-from atom.utils import envs
+from atom.utils import dp_balance_log, envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
@@ -5899,6 +5899,13 @@ class FusedMoE(torch.nn.Module):
         topk_weights, topk_ids = self.quant_method.place_experts(
             self, topk_weights, topk_ids, gathered
         )
+        if dp_balance_log.RUNNER is not None and not gathered:
+            dp_balance_log.ep_record(
+                dp_balance_log.RUNNER,
+                self,
+                topk_ids,
+                pass_scheduled_tokens_gpu(topk_ids.shape[0]),
+            )
         # Only Mxfp4MoEMethod takes a shared output (combine_accepts_shared).
         shared_kwargs = (
             {}

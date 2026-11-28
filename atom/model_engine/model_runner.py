@@ -77,6 +77,7 @@ from atom.model_engine.page_unit_checkpoint import (
     published_page_unit_bytes,
 )
 from atom.model_engine import sched_timing
+from atom.utils import dp_balance_log
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import (
     ScheduledBatch,
@@ -860,6 +861,7 @@ class ModelRunner:
     spec_status_deferred = False
     _sched_timer = None
     _st_marks = [0.0, 0.0, 0.0]
+    _dpb = None  # dp_balance_log.RunnerStepLog under ATOM_DP_BALANCE_LOG
     # Last PP stage under the IPC boundary: return before the sampled ids
     # reach the host, once the stage loop asks (`set_pp_async_out`).
     _pp_last_async_out = False
@@ -1091,6 +1093,17 @@ class ModelRunner:
         if sched_timing.ENABLED and rank == 0:
             self._sched_timer = sched_timing.StepTimer("worker0")
             self._st_gpu = sched_timing.GpuGapTimer(self._sched_timer)
+        log = dp_balance_log.open_log(
+            "runner",
+            dp_balance_log.RUNNER_FIELDS,
+            config,
+            config.parallel_config.data_parallel_rank,
+        )
+        if log is not None:
+            self._dpb = dp_balance_log.RunnerStepLog(
+                log, lambda: torch.cuda.Event(enable_timing=True)
+            )
+            dp_balance_log.RUNNER = self._dpb
         initialize_eplb_runtime(self)
         self._maybe_warmup()
 
@@ -2980,6 +2993,7 @@ class ModelRunner:
         # prepare_input_ids sizes the buffer, and because one call site is the
         # only way the step is guaranteed a single cross-DP collective.
         dp_size = self.config.parallel_config.data_parallel_size
+        t_meta = time.monotonic()
         forward_mode = ForwardMode.decide(
             batch=batch,
             dp_size=dp_size,
@@ -2999,6 +3013,8 @@ class ModelRunner:
             tbo_decode=self.config.enable_tbo_decode,
             tbo_decode_graphs=self.tbo_decode_graphs,
         )
+        if self._dpb is not None:
+            self._dpb.meta = (time.monotonic() - t_meta, forward_mode)
         forward_mode = self._cut_ubatches(forward_mode, batch)
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
@@ -3951,6 +3967,11 @@ class ModelRunner:
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         st = self._sched_timer
+        if st is None and self._dpb is not None:
+            t0 = time.monotonic()
+            out = self._forward(batch)
+            self._dpb.done(t0, time.monotonic(), batch)
+            return out
         if st is None or batch.is_dummy_run:
             return self._forward(batch)
         t0 = time.perf_counter()
@@ -4002,6 +4023,8 @@ class ModelRunner:
             self, batch, get_forward_context().spec_decode_metadata
         )
         marks[1] = time.perf_counter()
+        if self._dpb is not None:
+            self._dpb.launch()
         fence = self._may_take_mono(batch)
         if fence:
             self._fence_side_copies(before=True)
